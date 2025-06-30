@@ -47,6 +47,7 @@ class TransitionStateFrequencyCalculator:
     def identify_transition_state(self, energy_profile_file: str) -> Tuple[int, float, float]:
         """
         Identify the transition state from the energy profile.
+        Finds the local maximum (top of energy barrier) along the reaction path.
         
         Args:
             energy_profile_file: Path to final_energy_profile.dat
@@ -70,33 +71,124 @@ class TransitionStateFrequencyCalculator:
                 energies = data[:, 1]
                 relative_energies = data[:, 2]
             
-            # Find the maximum energy excluding endpoints
-            # Assume first and last are endpoints
-            interior_indices = list(range(1, len(energies) - 1))
+            # Convert to numpy arrays for easier manipulation
+            distances = np.array(distances)
+            energies = np.array(energies)
+            relative_energies = np.array(relative_energies)
             
-            if not interior_indices:
+            # Method 1: Find local maxima using gradient
+            logger.info("Searching for transition state (local maximum)...")
+            
+            # Calculate numerical gradient
+            if len(energies) < 3:
                 raise ValueError("Not enough images to identify transition state")
             
-            # Find max energy among interior images
-            max_energy = -np.inf
-            ts_index = None
+            # Find all local maxima (excluding endpoints)
+            local_maxima = []
+            for i in range(1, len(energies) - 1):
+                # Check if this point is higher than both neighbors
+                if energies[i] > energies[i-1] and energies[i] > energies[i+1]:
+                    local_maxima.append(i)
+                    logger.info(f"  Found local maximum at image {i}: E = {energies[i]:.6f} eV")
             
-            for idx in interior_indices:
-                if relative_energies[idx] > max_energy:
-                    max_energy = relative_energies[idx]
-                    ts_index = idx
+            # If no local maxima found, try relative energies
+            if not local_maxima:
+                logger.warning("No local maxima found in absolute energies, checking relative energies...")
+                for i in range(1, len(relative_energies) - 1):
+                    if relative_energies[i] > relative_energies[i-1] and relative_energies[i] > relative_energies[i+1]:
+                        local_maxima.append(i)
+                        logger.info(f"  Found local maximum at image {i}: Erel = {relative_energies[i]:.6f} eV")
+            
+            # Method 2: If still no local maxima, find the highest barrier
+            # (highest point between initial and final states)
+            if not local_maxima:
+                logger.warning("No local maxima found, searching for highest barrier...")
+                
+                # For each interior point, check if it's higher than both endpoints
+                # or if it's the highest point in a monotonic path
+                interior_indices = list(range(1, len(energies) - 1))
+                barriers = []
+                
+                for idx in interior_indices:
+                    # Calculate barrier height relative to the lower of the two endpoints
+                    barrier_from_initial = relative_energies[idx] - relative_energies[0]
+                    barrier_from_final = relative_energies[idx] - relative_energies[-1]
+                    
+                    # The effective barrier is relative to where we're coming from
+                    effective_barrier = max(barrier_from_initial, 
+                                          relative_energies[idx] - min(relative_energies[0], relative_energies[-1]))
+                    
+                    if effective_barrier > 0:
+                        barriers.append((idx, effective_barrier))
+                
+                if barriers:
+                    # Choose the highest barrier
+                    barriers.sort(key=lambda x: x[1], reverse=True)
+                    ts_index = barriers[0][0]
+                    logger.info(f"  Selected highest barrier at image {ts_index}")
+                else:
+                    # Last resort: just pick the highest energy interior point
+                    max_idx = 1 + np.argmax(relative_energies[1:-1])
+                    ts_index = max_idx
+                    logger.warning(f"  No clear barrier found, using highest energy point at image {ts_index}")
+            
+            else:
+                # If we found local maxima, choose the most significant one
+                if len(local_maxima) == 1:
+                    ts_index = local_maxima[0]
+                else:
+                    # Multiple local maxima - choose the one with highest barrier
+                    logger.info(f"  Found {len(local_maxima)} local maxima, selecting most significant...")
+                    
+                    max_barrier = -np.inf
+                    ts_index = None
+                    
+                    for idx in local_maxima:
+                        # Calculate barrier height as the minimum energy difference to neighboring minima
+                        # Look for local minima on both sides
+                        left_min = relative_energies[0]  # Start with initial energy
+                        for i in range(idx-1, 0, -1):
+                            if i > 0 and relative_energies[i] < relative_energies[i-1] and relative_energies[i] < relative_energies[i+1]:
+                                left_min = relative_energies[i]
+                                break
+                        
+                        right_min = relative_energies[-1]  # Start with final energy
+                        for i in range(idx+1, len(relative_energies)-1):
+                            if relative_energies[i] < relative_energies[i-1] and relative_energies[i] < relative_energies[i+1]:
+                                right_min = relative_energies[i]
+                                break
+                        
+                        # Barrier is the height above the higher of the two minima
+                        barrier = relative_energies[idx] - max(left_min, right_min)
+                        
+                        logger.info(f"    Image {idx}: barrier = {barrier:.3f} eV")
+                        
+                        if barrier > max_barrier:
+                            max_barrier = barrier
+                            ts_index = idx
             
             if ts_index is None:
                 raise ValueError("Could not identify transition state")
             
             ts_energy = energies[ts_index]
             ts_distance = distances[ts_index]
+            ts_relative_energy = relative_energies[ts_index]
+            
+            # Calculate actual barrier height
+            barrier_from_initial = ts_relative_energy - relative_energies[0]
+            barrier_from_final = ts_relative_energy - relative_energies[-1]
             
             logger.info(f"Identified transition state:")
             logger.info(f"  Image index: {ts_index}")
             logger.info(f"  Energy: {ts_energy:.6f} eV")
-            logger.info(f"  Relative energy: {max_energy:.6f} eV")
+            logger.info(f"  Relative energy: {ts_relative_energy:.6f} eV")
+            logger.info(f"  Barrier from initial: {barrier_from_initial:.3f} eV")
+            logger.info(f"  Barrier from final: {barrier_from_final:.3f} eV")
             logger.info(f"  Distance along path: {ts_distance:.3f} Å")
+            
+            # Verify this is a reasonable TS
+            if ts_index == 1 or ts_index == len(energies) - 2:
+                logger.warning("  Warning: TS is immediately adjacent to endpoint - may need more images")
             
             return ts_index, ts_energy, ts_distance
             
@@ -458,7 +550,82 @@ class TransitionStateFrequencyCalculator:
             logger.error(f"Error analyzing frequencies: {e}")
             return {}
     
-    def plot_frequency_spectrum(self, results: Dict, output_path: str) -> Optional[str]:
+    def plot_energy_profile_with_ts(self, energy_profile_file: str, ts_index: int, 
+                                   output_path: str) -> Optional[str]:
+        """
+        Plot the energy profile with the identified transition state marked.
+        
+        Args:
+            energy_profile_file: Path to energy profile data
+            ts_index: Index of identified transition state
+            output_path: Path for output plot
+            
+        Returns:
+            Path to created plot or None
+        """
+        try:
+            # Read the energy profile data
+            data = np.loadtxt(energy_profile_file, skiprows=1)
+            
+            if len(data.shape) == 1:
+                distances = [data[0]]
+                energies = [data[1]]
+                relative_energies = [data[2]]
+            else:
+                distances = data[:, 0]
+                energies = data[:, 1]
+                relative_energies = data[:, 2]
+            
+            # Create figure
+            plt.figure(figsize=(10, 6))
+            
+            # Plot the energy profile
+            plt.plot(distances, relative_energies, 'o-', linewidth=2, markersize=8, 
+                    color='blue', label='NEB path')
+            
+            # Mark the transition state
+            plt.plot(distances[ts_index], relative_energies[ts_index], 'o', 
+                    markersize=15, color='red', label='Transition State', zorder=5)
+            
+            # Mark initial and final states
+            plt.plot(distances[0], relative_energies[0], 's', 
+                    markersize=12, color='green', label='Initial', zorder=4)
+            plt.plot(distances[-1], relative_energies[-1], 's', 
+                    markersize=12, color='orange', label='Final', zorder=4)
+            
+            # Add annotations
+            barrier_from_initial = relative_energies[ts_index] - relative_energies[0]
+            plt.annotate(f'TS (Image {ts_index})\nBarrier: {barrier_from_initial:.3f} eV',
+                        xy=(distances[ts_index], relative_energies[ts_index]),
+                        xytext=(distances[ts_index], relative_energies[ts_index] + 0.1),
+                        ha='center', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7),
+                        arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+            
+            # Draw barrier height lines
+            plt.hlines(relative_energies[0], distances[0], distances[ts_index], 
+                      colors='gray', linestyles='dashed', alpha=0.5)
+            plt.vlines(distances[ts_index], relative_energies[0], relative_energies[ts_index], 
+                      colors='red', linestyles='dashed', alpha=0.5)
+            
+            # Labels and formatting
+            plt.xlabel('Reaction Coordinate (Å)')
+            plt.ylabel('Relative Energy (eV)')
+            plt.title('NEB Energy Profile with Identified Transition State')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Save plot
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Energy profile plot with TS saved to {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error creating energy profile plot: {e}")
+            return None
         """
         Create a plot of the frequency spectrum.
         
@@ -745,6 +912,13 @@ def run_ts_frequency_analysis(energy_profile_file: str, neb_dir: str,
                 results, os.path.join(output_dir, "frequency_spectrum.png")
             )
             results['plot_path'] = plot_path
+            
+            # Create energy profile plot with TS marked
+            profile_plot_path = freq_calc.plot_energy_profile_with_ts(
+                energy_profile_file, ts_index,
+                os.path.join(output_dir, "energy_profile_with_ts.png")
+            )
+            results['profile_plot_path'] = profile_plot_path
             
             # Generate comprehensive report
             report_path = freq_calc.generate_report(results, output_dir, ts_info)
