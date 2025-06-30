@@ -391,9 +391,8 @@ class TransitionStateFrequencyCalculator:
         except Exception as e:
             logger.error(f"Error setting up frequency calculation: {e}")
             return False
-    
     def _write_poscar_with_constraints(self, structure: Structure, filepath: str,
-                                      atoms_to_freeze: List[int]):
+                                  atoms_to_freeze: List[int]):
         """
         Write POSCAR with selective dynamics for frozen atoms.
         
@@ -402,20 +401,18 @@ class TransitionStateFrequencyCalculator:
             filepath: Output file path
             atoms_to_freeze: List of atom indices to freeze
         """
-        # Create a Poscar object
-        poscar = Poscar(structure)
-        
-        # Enable selective dynamics
-        poscar.selective_dynamics = []
-        
-        # Set up selective dynamics flags
+        # Create selective dynamics array
+        selective_dynamics = []
         for i in range(len(structure)):
             if i in atoms_to_freeze:
                 # Freeze this atom (False False False)
-                poscar.selective_dynamics.append([False, False, False])
+                selective_dynamics.append([False, False, False])
             else:
                 # Allow this atom to move (True True True)
-                poscar.selective_dynamics.append([True, True, True])
+                selective_dynamics.append([True, True, True])
+        
+        # Create a Poscar object with selective dynamics
+        poscar = Poscar(structure, selective_dynamics=selective_dynamics)
         
         # Write the file
         poscar.write_file(filepath)
