@@ -1,0 +1,1746 @@
+#!/usr/bin/env python
+"""
+Oxygen Migration Environment Analyzer
+=====================================
+Analyzes how the local environment and coordination of oxygen atoms
+change during NEB migration and correlates with energy changes.
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Rectangle
+from matplotlib.collections import PatchCollection
+import matplotlib.patches as mpatches
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+import seaborn as sns
+from pymatgen.core import Structure
+from pymatgen.analysis.local_env import CrystalNN, VoronoiNN, MinimumDistanceNN
+from pymatgen.analysis.structure_analyzer import OrderParameters
+from typing import List, Dict, Optional, Tuple, Any
+import logging
+from collections import defaultdict
+import pandas as pd
+import json
+logger = logging.getLogger(__name__)
+
+class OxygenEnvironmentAnalyzer:
+    """
+    Analyzes the local environment of oxygen atoms during migration.
+    """
+    
+    def __init__(self, cutoff_radius: float = 3.5):
+        """
+        Initialize analyzer with cutoff radius for neighbor detection.
+        
+        Args:
+            cutoff_radius: Maximum distance to consider for neighbors (Å)
+        """
+        self.cutoff_radius = cutoff_radius
+        self.cnn = CrystalNN()  # Crystal structure-based neighbor finder
+        self.vnn = VoronoiNN()  # Voronoi-based neighbor finder
+        self.mdnn = MinimumDistanceNN(cutoff=cutoff_radius)  # Distance-based
+    
+    def _identify_transitions(self, environment_data: List[Dict],
+                                 energies: List[float]) -> Dict:
+        """
+        Improved transition identification using topological analysis.
+        
+        Args:
+            environment_data: List of environment analysis
+            energies: List of energies for each image
+            
+        Returns:
+            Dictionary with improved transition analysis
+        """
+        from .improved_transition_state_detection import TransitionStateAnalyzer, improved_transition_state_analysis
+        
+        # Use improved transition state analysis
+        topology = improved_transition_state_analysis(energies, environment_data)
+        
+        transitions = {
+            'coordination_changes': [],
+            'max_distortion': None,
+            'transition_state': None,
+            'all_transition_states': topology['transition_states'],
+            'local_minima': topology['local_minima'],
+            'reaction_classification': topology['reaction_classification'],
+            'energetics': topology['energetics']
+        }
+        
+        # Find coordination changes (as before)
+        for i in range(1, len(environment_data)):
+            prev_cn = environment_data[i-1]['geometry']['coordination_number']
+            curr_cn = environment_data[i]['geometry']['coordination_number']
+            
+            if prev_cn != curr_cn:
+                transitions['coordination_changes'].append({
+                    'images': (i-1, i),
+                    'change': (prev_cn, curr_cn),
+                    'energy_change': energies[i] - energies[i-1]
+                })
+        
+        # Find maximum distortion
+        max_distortion = 0
+        max_distortion_image = 0
+        
+        for i, env in enumerate(environment_data):
+            distortion = env['geometry'].get('bond_distortion_index', 0)
+            if distortion > max_distortion:
+                max_distortion = distortion
+                max_distortion_image = i
+        
+        transitions['max_distortion'] = {
+            'image': max_distortion_image,
+            'distortion': max_distortion,
+            'energy': energies[max_distortion_image] if max_distortion_image < len(energies) else None
+        }
+        
+        # Use improved transition state identification
+        if topology['primary_transition_state']:
+            ts = topology['primary_transition_state']
+            ts_idx = ts['image']
+            
+            transitions['transition_state'] = {
+                'image': ts_idx,
+                'energy': energies[ts_idx] - energies[0],  # Relative energy
+                'absolute_energy': energies[ts_idx],
+                'coordination': environment_data[ts_idx]['geometry']['coordination_number'],
+                'avg_bond_length': environment_data[ts_idx]['coordination']['average_bond_length'],
+                'geometry_type': environment_data[ts_idx]['geometry']['geometry_type'],
+                'bond_distortion': environment_data[ts_idx]['geometry'].get('bond_distortion_index', 0),
+                'validation': ts.get('validation', {}),
+                'type': ts['type']
+            }
+            
+            # Add detailed analysis of TS environment
+            ts_env = environment_data[ts_idx]
+            initial_env = environment_data[0]
+            final_env = environment_data[-1]
+            
+            transitions['transition_state']['structural_analysis'] = {
+                'cn_initial_to_ts': initial_env['geometry']['coordination_number'] - ts_env['geometry']['coordination_number'],
+                'cn_ts_to_final': ts_env['geometry']['coordination_number'] - final_env['geometry']['coordination_number'],
+                'bond_length_change_initial': ts_env['coordination']['average_bond_length'] - initial_env['coordination']['average_bond_length'],
+                'bond_length_change_final': final_env['coordination']['average_bond_length'] - ts_env['coordination']['average_bond_length'],
+                'neighbor_type_changes': {
+                    'initial_vs_ts': self._compare_neighbor_types(initial_env['coordination']['neighbor_types'], 
+                                                                ts_env['coordination']['neighbor_types']),
+                    'ts_vs_final': self._compare_neighbor_types(ts_env['coordination']['neighbor_types'], 
+                                                            final_env['coordination']['neighbor_types'])
+                }
+            }
+        
+        return transitions
+
+    def _compare_neighbor_types(self, neighbors1: Dict, neighbors2: Dict) -> Dict:
+        """Compare neighbor type distributions between two environments."""
+        changes = {}
+        
+        all_elements = set(neighbors1.keys()) | set(neighbors2.keys())
+        
+        for element in all_elements:
+            count1 = neighbors1.get(element, 0)
+            count2 = neighbors2.get(element, 0)
+            if count1 != count2:
+                changes[element] = {'from': count1, 'to': count2, 'change': count2 - count1}
+        
+        return changes
+
+    def analyze_coordination(self, structure: Structure, atom_idx: int, 
+                           method: str = 'crystal') -> Dict:
+        """
+        Analyze coordination environment of an atom.
+        
+        Args:
+            structure: Crystal structure
+            atom_idx: Index of atom to analyze
+            method: Method for neighbor detection ('crystal', 'voronoi', 'distance')
+            
+        Returns:
+            Dictionary with coordination information
+        """
+        if method == 'crystal':
+            nn_finder = self.cnn
+        elif method == 'voronoi':
+            nn_finder = self.vnn
+        else:
+            nn_finder = self.mdnn
+            
+        try:
+            # Get neighbors
+            neighbors = nn_finder.get_nn_info(structure, atom_idx)
+            
+            # Analyze coordination
+            coord_info = {
+                'coordination_number': len(neighbors),
+                'neighbors': [],
+                'bond_lengths': [],
+                'neighbor_types': defaultdict(int),
+                'average_bond_length': 0.0,
+                'min_bond_length': float('inf'),
+                'max_bond_length': 0.0
+            }
+            
+            for neighbor in neighbors:
+                element = str(structure[neighbor['site_index']].specie)
+                distance = neighbor.get('weight', 0.0)  # Weight often stores distance
+                
+                # For some methods, calculate distance manually
+                if distance == 0.0:
+                    site1 = structure[atom_idx].coords
+                    site2 = structure[neighbor['site_index']].coords
+                    distance = np.linalg.norm(site1 - site2)
+                
+                coord_info['neighbors'].append({
+                    'index': neighbor['site_index'],
+                    'element': element,
+                    'distance': distance,
+                    'image': neighbor.get('image', [0, 0, 0])
+                })
+                
+                coord_info['bond_lengths'].append(distance)
+                coord_info['neighbor_types'][element] += 1
+                
+            # Calculate statistics
+            if coord_info['bond_lengths']:
+                coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
+                coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
+                coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
+                
+        except Exception as e:
+            logger.warning(f"Error analyzing coordination: {e}")
+            # Fallback to simple distance-based analysis
+            coord_info = self._simple_coordination_analysis(structure, atom_idx)
+            
+        return coord_info
+    
+    def _simple_coordination_analysis(self, structure: Structure, 
+                                    atom_idx: int) -> Dict:
+        """
+        Simple distance-based coordination analysis as fallback.
+        """
+        coord_info = {
+            'coordination_number': 0,
+            'neighbors': [],
+            'bond_lengths': [],
+            'neighbor_types': defaultdict(int),
+            'average_bond_length': 0.0,
+            'min_bond_length': float('inf'),
+            'max_bond_length': 0.0
+        }
+        
+        atom_pos = structure[atom_idx].coords
+        
+        for i, site in enumerate(structure):
+            if i == atom_idx:
+                continue
+                
+            distance = np.linalg.norm(site.coords - atom_pos)
+            
+            if distance <= self.cutoff_radius:
+                element = str(site.specie)
+                
+                coord_info['neighbors'].append({
+                    'index': i,
+                    'element': element,
+                    'distance': distance,
+                    'image': [0, 0, 0]
+                })
+                
+                coord_info['bond_lengths'].append(distance)
+                coord_info['neighbor_types'][element] += 1
+        
+        coord_info['coordination_number'] = len(coord_info['neighbors'])
+        
+        if coord_info['bond_lengths']:
+            coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
+            coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
+            coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
+            
+        return coord_info
+    
+    def analyze_bond_angles(self, structure: Structure, atom_idx: int,
+                           coord_info: Dict) -> Dict:
+        """
+        Analyze bond angles around an atom.
+        
+        Args:
+            structure: Crystal structure
+            atom_idx: Central atom index
+            coord_info: Coordination information from analyze_coordination
+            
+        Returns:
+            Dictionary with bond angle information
+        """
+        if len(coord_info['neighbors']) < 2:
+            return {'bond_angles': [], 'average_angle': None}
+        
+        bond_angles = []
+        angle_info = []
+        center_pos = structure[atom_idx].coords
+        
+        # Calculate all pairwise angles
+        for i in range(len(coord_info['neighbors'])):
+            for j in range(i + 1, len(coord_info['neighbors'])):
+                neighbor1 = coord_info['neighbors'][i]
+                neighbor2 = coord_info['neighbors'][j]
+                
+                pos1 = structure[neighbor1['index']].coords
+                pos2 = structure[neighbor2['index']].coords
+                
+                # Calculate vectors from center to neighbors
+                vec1 = pos1 - center_pos
+                vec2 = pos2 - center_pos
+                
+                # Calculate angle
+                cos_angle = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+                cos_angle = np.clip(cos_angle, -1, 1)  # Handle numerical errors
+                angle = np.degrees(np.arccos(cos_angle))
+                
+                bond_angles.append(angle)
+                angle_info.append({
+                    'atom1': neighbor1['index'],
+                    'atom2': neighbor2['index'],
+                    'element1': neighbor1['element'],
+                    'element2': neighbor2['element'],
+                    'angle': angle
+                })
+        
+        return {
+            'bond_angles': bond_angles,
+            'angle_info': angle_info,
+            'average_angle': np.mean(bond_angles) if bond_angles else None,
+            'min_angle': min(bond_angles) if bond_angles else None,
+            'max_angle': max(bond_angles) if bond_angles else None
+        }
+    
+    def calculate_geometry_parameters(self, structure: Structure, 
+                                    atom_idx: int, coord_info: Dict) -> Dict:
+        """
+        Calculate geometry parameters like octahedral/tetrahedral distortion.
+        
+        Args:
+            structure: Crystal structure
+            atom_idx: Central atom index
+            coord_info: Coordination information
+            
+        Returns:
+            Dictionary with geometry parameters
+        """
+        cn = coord_info['coordination_number']
+        
+        geometry_params = {
+            'coordination_number': cn,
+            'geometry_type': None,
+            'distortion_index': None,
+            'bond_length_variance': None
+        }
+        
+        # Determine likely geometry
+        if cn == 4:
+            geometry_params['geometry_type'] = 'tetrahedral'
+            ideal_angle = 109.47  # Tetrahedral angle
+        elif cn == 6:
+            geometry_params['geometry_type'] = 'octahedral'
+            ideal_angle = 90.0  # Octahedral angle
+        elif cn == 5:
+            geometry_params['geometry_type'] = 'trigonal_bipyramidal'
+            ideal_angle = 90.0  # Simplified
+        else:
+            geometry_params['geometry_type'] = f'CN_{cn}'
+            ideal_angle = None
+        
+        # Calculate bond length variance
+        if coord_info['bond_lengths']:
+            bond_lengths = coord_info['bond_lengths']
+            geometry_params['bond_length_variance'] = np.var(bond_lengths)
+            geometry_params['bond_length_std'] = np.std(bond_lengths)
+            
+            # Distortion index based on bond lengths
+            if len(bond_lengths) > 1:
+                avg_length = np.mean(bond_lengths)
+                distortion = np.sum([(l - avg_length)**2 for l in bond_lengths]) / len(bond_lengths)
+                geometry_params['bond_distortion_index'] = np.sqrt(distortion) / avg_length
+        
+        # Calculate angular distortion if applicable
+        angle_data = self.analyze_bond_angles(structure, atom_idx, coord_info)
+        if angle_data['bond_angles'] and ideal_angle is not None:
+            angles = angle_data['bond_angles']
+            angle_deviations = [abs(angle - ideal_angle) for angle in angles]
+            geometry_params['angular_distortion'] = np.mean(angle_deviations)
+            
+        return geometry_params
+    
+    def track_environment_changes(self, structures: List[Structure],
+                                moving_atom_idx: int) -> List[Dict]:
+        """
+        Track how the environment changes along the NEB path.
+        
+        Args:
+            structures: List of structures along NEB path
+            moving_atom_idx: Index of moving oxygen atom
+            
+        Returns:
+            List of environment analysis for each image
+        """
+        environment_data = []
+        
+        for i, struct in enumerate(structures):
+            logger.debug(f"Analyzing environment for image {i}")
+            
+            # Analyze coordination
+            coord_info = self.analyze_coordination(struct, moving_atom_idx)
+            
+            # Analyze geometry
+            geometry = self.calculate_geometry_parameters(struct, moving_atom_idx, coord_info)
+            
+            # Analyze bond angles
+            angles = self.analyze_bond_angles(struct, moving_atom_idx, coord_info)
+            
+            # Combine all data
+            env_data = {
+                'image': i,
+                'coordination': coord_info,
+                'geometry': geometry,
+                'angles': angles
+            }
+            
+            environment_data.append(env_data)
+            
+        return environment_data
+    def correlate_with_energy(self, environment_data: List[Dict],
+                                 energies: List[float]) -> Dict:
+        """
+        Improved correlation analysis with better transition state identification.
+        """
+        if len(environment_data) != len(energies):
+            logger.error("Mismatch between environment data and energies")
+            return {}
+        
+        # Extract key parameters (same as before)
+        coord_numbers = [env['geometry']['coordination_number'] for env in environment_data]
+        avg_bond_lengths = [env['coordination']['average_bond_length'] for env in environment_data]
+        bond_variances = [env['geometry'].get('bond_length_variance', 0) for env in environment_data]
+        
+        # Calculate relative energies
+        rel_energies = [e - energies[0] for e in energies]
+        
+        # Find correlations (same as before)
+        correlations = {
+            'coordination_energy': self._calculate_correlation(coord_numbers, rel_energies),
+            'bond_length_energy': self._calculate_correlation(avg_bond_lengths, rel_energies),
+            'distortion_energy': self._calculate_correlation(bond_variances, rel_energies),
+            'data': {
+                'coordination_numbers': coord_numbers,
+                'average_bond_lengths': avg_bond_lengths,
+                'bond_variances': bond_variances,
+                'relative_energies': rel_energies
+            }
+        }
+        
+        # Use improved transition identification
+        correlations['transitions'] = self._identify_transitions(environment_data, energies)
+        
+        return correlations
+
+    
+    def _calculate_correlation(self, x: List[float], y: List[float]) -> float:
+        """Calculate Pearson correlation coefficient."""
+        if len(x) != len(y) or len(x) < 2:
+            return 0.0
+        
+        x_array = np.array(x)
+        y_array = np.array(y)
+        
+        # Handle cases with constant values
+        if np.std(x_array) == 0 or np.std(y_array) == 0:
+            return 0.0
+            
+        return np.corrcoef(x_array, y_array)[0, 1]
+    
+
+    def analyze_energy_landscape_features(self, environment_data: List[Dict],
+                                        energies: List[float]) -> Dict:
+        """
+        Analyze key features of the energy landscape in relation to structural changes.
+        
+        Args:
+            environment_data: List of environment analysis
+            energies: List of energies for each image
+            
+        Returns:
+            Dictionary with detailed landscape analysis
+        """
+        rel_energies = [e - energies[0] for e in energies]
+        
+        # Find key points
+        initial_idx = 0
+        final_idx = len(energies) - 1
+        ts_idx = np.argmax(rel_energies)
+        
+        # Local minima and maxima
+        minima = []
+        maxima = []
+        
+        for i in range(1, len(rel_energies) - 1):
+            if (rel_energies[i] < rel_energies[i-1] and 
+                rel_energies[i] < rel_energies[i+1]):
+                minima.append(i)
+            elif (rel_energies[i] > rel_energies[i-1] and 
+                  rel_energies[i] > rel_energies[i+1]):
+                maxima.append(i)
+        
+        # Analyze each key point
+        key_points = {
+            'initial': self._analyze_key_point(environment_data[initial_idx], 
+                                             rel_energies[initial_idx], 'Initial'),
+            'transition_state': self._analyze_key_point(environment_data[ts_idx], 
+                                                      rel_energies[ts_idx], 'Transition State'),
+            'final': self._analyze_key_point(environment_data[final_idx], 
+                                           rel_energies[final_idx], 'Final'),
+            'local_minima': [self._analyze_key_point(environment_data[i], 
+                                                   rel_energies[i], f'Local Min {i}') 
+                           for i in minima],
+            'local_maxima': [self._analyze_key_point(environment_data[i], 
+                                                   rel_energies[i], f'Local Max {i}') 
+                           for i in maxima]
+        }
+        
+        # Calculate energy barriers and differences
+        activation_energy = rel_energies[ts_idx] - rel_energies[initial_idx]
+        reaction_energy = rel_energies[final_idx] - rel_energies[initial_idx]
+        
+        landscape_features = {
+            'key_points': key_points,
+            'activation_energy': activation_energy,
+            'reaction_energy': reaction_energy,
+            'is_endothermic': reaction_energy > 0,
+            'barrier_asymmetry': (rel_energies[ts_idx] - rel_energies[initial_idx]) / 
+                               (rel_energies[ts_idx] - rel_energies[final_idx]) if rel_energies[ts_idx] != rel_energies[final_idx] else 1.0,
+            'energy_profile_roughness': np.std(rel_energies),
+            'steepest_ascent': max([rel_energies[i+1] - rel_energies[i] for i in range(len(rel_energies)-1)]),
+            'steepest_descent': min([rel_energies[i+1] - rel_energies[i] for i in range(len(rel_energies)-1)])
+        }
+        
+        return landscape_features
+    
+    def _analyze_key_point(self, env_data: Dict, energy: float, label: str) -> Dict:
+        """Analyze a specific key point in the pathway."""
+        return {
+            'label': label,
+            'image': env_data['image'],
+            'energy': energy,
+            'coordination_number': env_data['geometry']['coordination_number'],
+            'geometry_type': env_data['geometry']['geometry_type'],
+            'average_bond_length': env_data['coordination']['average_bond_length'],
+            'bond_distortion': env_data['geometry'].get('bond_distortion_index', 0),
+            'neighbor_types': dict(env_data['coordination']['neighbor_types']),
+            'average_angle': env_data['angles'].get('average_angle'),
+            'bond_length_range': (env_data['coordination']['min_bond_length'],
+                                env_data['coordination']['max_bond_length'])
+        }
+    
+    def save_analysis_report(self, environment_data: List[Dict], 
+                           energies: List[float],
+                           correlations: Dict,
+                           landscape_features: Dict,
+                           output_path: str = None) -> str:
+        """
+        Save comprehensive analysis report to file.
+        
+        Args:
+            environment_data: Environment analysis data
+            energies: Energy values
+            correlations: Correlation analysis
+            landscape_features: Energy landscape features
+            output_path: Output file path
+            
+        Returns:
+            Path to saved report
+        """
+        if output_path is None:
+            output_path = "oxygen_migration_analysis_report.txt"
+        
+        with open(output_path, 'w') as f:
+            f.write("Oxygen Migration Environment Analysis Report\n")
+            f.write("=" * 50 + "\n\n")
+            
+            # Energy landscape summary
+            f.write("ENERGY LANDSCAPE SUMMARY\n")
+            f.write("-" * 25 + "\n")
+            f.write(f"Activation Energy: {landscape_features['activation_energy']:.3f} eV\n")
+            f.write(f"Reaction Energy: {landscape_features['reaction_energy']:.3f} eV\n")
+            f.write(f"Reaction Type: {'Endothermic' if landscape_features['is_endothermic'] else 'Exothermic'}\n")
+            f.write(f"Barrier Asymmetry: {landscape_features['barrier_asymmetry']:.3f}\n")
+            f.write(f"Energy Profile Roughness: {landscape_features['energy_profile_roughness']:.3f} eV\n\n")
+            
+            # Key points analysis
+            f.write("KEY POINTS ANALYSIS\n")
+            f.write("-" * 20 + "\n")
+            for point_type, point_data in landscape_features['key_points'].items():
+                if isinstance(point_data, list):
+                    for point in point_data:
+                        self._write_point_analysis(f, point)
+                else:
+                    self._write_point_analysis(f, point_data)
+            
+            # Coordination evolution
+            f.write("\nCOORDINATION EVOLUTION\n")
+            f.write("-" * 22 + "\n")
+            for i, env in enumerate(environment_data):
+                coord = env['coordination']
+                geom = env['geometry']
+                f.write(f"Image {i:2d}: CN={geom['coordination_number']:2d}, "
+                       f"Avg Bond={coord['average_bond_length']:.3f} Å, "
+                       f"Geometry={geom['geometry_type']}\n")
+            
+            # Correlations
+            f.write(f"\nSTRUCTURE-ENERGY CORRELATIONS\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Coordination vs Energy: {correlations['coordination_energy']:.3f}\n")
+            f.write(f"Bond Length vs Energy: {correlations['bond_length_energy']:.3f}\n")
+            f.write(f"Distortion vs Energy: {correlations['distortion_energy']:.3f}\n")
+            
+            # Transitions
+            transitions = correlations['transitions']
+            if transitions['coordination_changes']:
+                f.write(f"\nCOORDINATION CHANGES\n")
+                f.write("-" * 20 + "\n")
+                for change in transitions['coordination_changes']:
+                    f.write(f"Images {change['images'][0]} → {change['images'][1]}: "
+                           f"CN {change['change'][0]} → {change['change'][1]}, "
+                           f"ΔE = {change['energy_change']:.3f} eV\n")
+            
+            # Transition state details
+            if transitions['transition_state']:
+                ts = transitions['transition_state']
+                f.write(f"\nTRANSITION STATE DETAILS\n")
+                f.write("-" * 25 + "\n")
+                f.write(f"Image: {ts['image']}\n")
+                f.write(f"Energy: {ts['energy']:.3f} eV\n")
+                f.write(f"Coordination: {ts['coordination']}\n")
+                f.write(f"Average Bond Length: {ts['avg_bond_length']:.3f} Å\n")
+        
+        logger.info(f"Analysis report saved to {output_path}")
+        return output_path
+    
+    def _write_point_analysis(self, f, point_data: Dict):
+        """Helper to write analysis for a key point."""
+        f.write(f"\n{point_data['label']} (Image {point_data['image']}):\n")
+        f.write(f"  Energy: {point_data['energy']:.3f} eV\n")
+        f.write(f"  Coordination: {point_data['coordination_number']} ({point_data['geometry_type']})\n")
+        f.write(f"  Avg Bond Length: {point_data['average_bond_length']:.3f} Å\n")
+        f.write(f"  Bond Distortion: {point_data['bond_distortion']:.4f}\n")
+        f.write(f"  Neighbor Types: {point_data['neighbor_types']}\n")
+        if point_data['average_angle']:
+            f.write(f"  Average Angle: {point_data['average_angle']:.1f}°\n")
+
+
+class OxygenPathwayVisualizer:
+    """
+    Visualizes oxygen migration pathway with environmental analysis.
+    """
+    
+    def __init__(self, analyzer: OxygenEnvironmentAnalyzer = None):
+        """
+        Initialize visualizer.
+        
+        Args:
+            analyzer: OxygenEnvironmentAnalyzer instance
+        """
+        self.analyzer = analyzer or OxygenEnvironmentAnalyzer()
+        
+        # Color schemes
+        self.element_colors = {
+            'O': '#FF0000',
+            'La': '#00CED1',
+            'Ni': '#A0A0A0',
+            'V': '#FFA500',
+            'Fe': '#B22222',
+            'Co': '#FF1493',
+            'Mn': '#9370DB',
+            'Ti': '#708090',
+            'Nb': '#4682B4'
+        }
+        
+    def plot_coordination_evolution(self, environment_data: List[Dict],
+                                  energies: List[float] = None,
+                                  output_path: str = None) -> str:
+        """
+        Plot how coordination environment evolves along the path.
+        
+        Args:
+            environment_data: List of environment analysis
+            energies: Optional energy profile
+            output_path: Output file path
+            
+        Returns:
+            Path to saved plot
+        """
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        
+        images = [env['image'] for env in environment_data]
+        
+        # Plot 1: Coordination number
+        ax1 = axes[0]
+        coord_numbers = [env['geometry']['coordination_number'] for env in environment_data]
+        ax1.plot(images, coord_numbers, 'o-', linewidth=2, markersize=8)
+        ax1.set_ylabel('Coordination Number', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim(min(coord_numbers) - 0.5, max(coord_numbers) + 0.5)
+        
+        # Plot 2: Average bond length
+        ax2 = axes[1]
+        avg_lengths = [env['coordination']['average_bond_length'] for env in environment_data]
+        ax2.plot(images, avg_lengths, 's-', color='green', linewidth=2, markersize=8)
+        ax2.set_ylabel('Average Bond Length (Å)', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        
+        # Add error bars for bond length variation
+        bond_stds = [env['geometry'].get('bond_length_std', 0) for env in environment_data]
+        ax2.errorbar(images, avg_lengths, yerr=bond_stds, fmt='none', 
+                    ecolor='green', alpha=0.5, capsize=5)
+        
+        # Plot 3: Energy profile (if provided)
+        ax3 = axes[2]
+        if energies:
+            rel_energies = [e - energies[0] for e in energies]
+            ax3.plot(images, rel_energies, 'o-', color='red', linewidth=2, markersize=8)
+            ax3.set_ylabel('Relative Energy (eV)', fontsize=12)
+            
+            # Mark transition state
+            ts_idx = np.argmax(rel_energies)
+            ax3.plot(ts_idx, rel_energies[ts_idx], 'o', color='purple', 
+                    markersize=12, label='Transition State')
+            ax3.legend()
+        else:
+            # Plot distortion index instead
+            distortions = [env['geometry'].get('bond_distortion_index', 0) 
+                          for env in environment_data]
+            ax3.plot(images, distortions, '^-', color='orange', linewidth=2, markersize=8)
+            ax3.set_ylabel('Bond Distortion Index', fontsize=12)
+        
+        ax3.set_xlabel('Image Number', fontsize=12)
+        ax3.grid(True, alpha=0.3)
+        
+        # Add vertical lines for coordination changes
+        for i in range(1, len(coord_numbers)):
+            if coord_numbers[i] != coord_numbers[i-1]:
+                for ax in axes:
+                    ax.axvline(x=i-0.5, color='gray', linestyle='--', alpha=0.5)
+        
+        plt.suptitle('Oxygen Environment Evolution Along Migration Path', 
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        if output_path is None:
+            output_path = "coordination_evolution.png"
+        
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    def plot_environment_snapshot(self, structure: Structure, atom_idx: int,
+                                coord_info: Dict, image_number: int,
+                                projection: str = 'xy',
+                                output_path: str = None) -> str:
+        """
+        Plot a snapshot of the local environment around the oxygen atom.
+        
+        Args:
+            structure: Crystal structure
+            atom_idx: Index of central oxygen atom
+            coord_info: Coordination information
+            image_number: NEB image number
+            projection: Projection plane ('xy', 'xz', 'yz')
+            output_path: Output file path
+            
+        Returns:
+            Path to saved plot
+        """
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # Get projection indices
+        proj_map = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}
+        x_idx, y_idx = proj_map.get(projection, (0, 1))
+        
+        # Central oxygen position
+        center_pos = structure[atom_idx].coords
+        center_x, center_y = center_pos[x_idx], center_pos[y_idx]
+        
+        # Plot central oxygen
+        ax.scatter(center_x, center_y, s=500, c='red', edgecolor='black',
+                  linewidth=2, zorder=10, label='O (migrating)')
+        
+        # Plot neighbors with bonds
+        for neighbor in coord_info['neighbors']:
+            n_idx = neighbor['index']
+            n_pos = structure[n_idx].coords
+            n_element = neighbor['element']
+            n_distance = neighbor['distance']
+            
+            n_x, n_y = n_pos[x_idx], n_pos[y_idx]
+            
+            # Plot neighbor
+            color = self.element_colors.get(n_element, 'gray')
+            ax.scatter(n_x, n_y, s=300, c=color, edgecolor='black',
+                      linewidth=1, alpha=0.8)
+            
+            # Draw bond
+            ax.plot([center_x, n_x], [center_y, n_y], 'k-', alpha=0.5, linewidth=2)
+            
+            # Add distance label
+            mid_x, mid_y = (center_x + n_x) / 2, (center_y + n_y) / 2
+            ax.text(mid_x, mid_y, f'{n_distance:.2f}', fontsize=9,
+                   ha='center', va='center', bbox=dict(boxstyle='round,pad=0.3',
+                   facecolor='white', alpha=0.7))
+            
+            # Add element label
+            ax.text(n_x, n_y + 0.3, n_element, fontsize=10, ha='center', va='bottom')
+        
+        # Add coordination info
+        info_text = f'Image {image_number}\nCN = {coord_info["coordination_number"]}\n'
+        info_text += f'Avg bond: {coord_info["average_bond_length"]:.3f} Å'
+        
+        ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
+               fontsize=12, verticalalignment='top',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        # Format plot
+        ax.set_xlabel(f'{projection[0].upper()} (Å)', fontsize=12)
+        ax.set_ylabel(f'{projection[1].upper()} (Å)', fontsize=12)
+        ax.set_title(f'Local Environment - Image {image_number}', fontsize=14)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        # Set reasonable limits
+        margin = 4.0
+        ax.set_xlim(center_x - margin, center_x + margin)
+        ax.set_ylim(center_y - margin, center_y + margin)
+        
+        if output_path is None:
+            output_path = f"environment_snapshot_img{image_number}.png"
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    def plot_bond_distribution(self, environment_data: List[Dict],
+                             output_path: str = None) -> str:
+        """
+        Plot bond length distributions for each image.
+        
+        Args:
+            environment_data: List of environment analysis
+            output_path: Output file path
+            
+        Returns:
+            Path to saved plot
+        """
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Prepare data for violin plot
+        bond_data = []
+        positions = []
+        
+        for env in environment_data:
+            bond_lengths = env['coordination']['bond_lengths']
+            if bond_lengths:
+                bond_data.extend(bond_lengths)
+                positions.extend([env['image']] * len(bond_lengths))
+        
+        # Create DataFrame for easier plotting
+        df = pd.DataFrame({'Image': positions, 'Bond Length': bond_data})
+        
+        # Create violin plot
+        sns.violinplot(data=df, x='Image', y='Bond Length', ax=ax, inner='box')
+        
+        # Add mean line
+        mean_lengths = [env['coordination']['average_bond_length'] 
+                       for env in environment_data]
+        images = [env['image'] for env in environment_data]
+        ax.plot(images, mean_lengths, 'r-', linewidth=2, label='Mean', zorder=10)
+        
+        # Format plot
+        ax.set_xlabel('Image Number', fontsize=12)
+        ax.set_ylabel('Bond Length (Å)', fontsize=12)
+        ax.set_title('O-Neighbor Bond Length Distribution Along Path', fontsize=14)
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.legend()
+        
+        if output_path is None:
+            output_path = "bond_distribution.png"
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    def plot_correlation_analysis(self, correlations: Dict,
+                                output_path: str = None) -> str:
+        """
+        Plot correlation between structural parameters and energy.
+        
+        Args:
+            correlations: Correlation analysis from correlate_with_energy
+            output_path: Output file path
+            
+        Returns:
+            Path to saved plot
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        data = correlations['data']
+        
+        # Plot 1: Coordination vs Energy
+        ax1 = axes[0, 0]
+        ax1.scatter(data['coordination_numbers'], data['relative_energies'], 
+                   s=100, alpha=0.7)
+        ax1.set_xlabel('Coordination Number')
+        ax1.set_ylabel('Relative Energy (eV)')
+        ax1.set_title(f'Correlation: {correlations["coordination_energy"]:.3f}')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Bond Length vs Energy
+        ax2 = axes[0, 1]
+        sc2 = ax2.scatter(data['average_bond_lengths'], data['relative_energies'],
+                         c=range(len(data['average_bond_lengths'])), 
+                         cmap='viridis', s=100, alpha=0.7)
+        ax2.set_xlabel('Average Bond Length (Å)')
+        ax2.set_ylabel('Relative Energy (eV)')
+        ax2.set_title(f'Correlation: {correlations["bond_length_energy"]:.3f}')
+        ax2.grid(True, alpha=0.3)
+        plt.colorbar(sc2, ax=ax2, label='Image')
+        
+        # Plot 3: Distortion vs Energy
+        ax3 = axes[1, 0]
+        ax3.scatter(data['bond_variances'], data['relative_energies'],
+                   s=100, alpha=0.7, color='orange')
+        ax3.set_xlabel('Bond Length Variance')
+        ax3.set_ylabel('Relative Energy (eV)')
+        ax3.set_title(f'Correlation: {correlations["distortion_energy"]:.3f}')
+        ax3.grid(True, alpha=0.3)
+        
+        # Plot 4: Summary text
+        ax4 = axes[1, 1]
+        ax4.axis('off')
+        
+        summary_text = "Key Findings:\n\n"
+        
+        # Add transition information
+        transitions = correlations['transitions']
+        if transitions['coordination_changes']:
+            summary_text += "Coordination Changes:\n"
+            for change in transitions['coordination_changes']:
+                summary_text += f"  Images {change['images']}: "
+                summary_text += f"CN {change['change'][0]} → {change['change'][1]}\n"
+                summary_text += f"  Energy change: {change['energy_change']:.3f} eV\n"
+        
+        if transitions['transition_state']:
+            ts = transitions['transition_state']
+            summary_text += f"\nTransition State (Image {ts['image']}):\n"
+            summary_text += f"  Energy: {ts['energy']:.3f} eV\n"
+            summary_text += f"  CN: {ts['coordination']}\n"
+            summary_text += f"  Avg bond: {ts['avg_bond_length']:.3f} Å\n"
+        
+        ax4.text(0.1, 0.9, summary_text, transform=ax4.transAxes,
+                fontsize=11, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        
+        plt.suptitle('Structure-Energy Correlations', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        if output_path is None:
+            output_path = "correlation_analysis.png"
+        
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    def create_environment_movie_frames(self, structures: List[Structure],
+                                      moving_atom_idx: int,
+                                      environment_data: List[Dict],
+                                      energies: List[float] = None,
+                                      output_dir: str = None) -> List[str]:
+        """
+        Create frames for an animation showing environment changes.
+        
+        Args:
+            structures: List of structures along path
+            moving_atom_idx: Index of moving oxygen
+            environment_data: Environment analysis data
+            energies: Optional energy values
+            output_dir: Output directory for frames
+            
+        Returns:
+            List of frame file paths
+        """
+        if output_dir is None:
+            output_dir = "movie_frames"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        frame_paths = []
+        rel_energies = [e - energies[0] for e in energies] if energies else None
+        
+        for i, (struct, env_data) in enumerate(zip(structures, environment_data)):
+            frame_path = os.path.join(output_dir, f"frame_{i:03d}.png")
+            
+            # Create comprehensive frame showing structure + analysis
+            fig = plt.figure(figsize=(16, 10))
+            
+            # Left panel: 3D structure view
+            ax1 = fig.add_subplot(121, projection='3d')
+            self._plot_3d_environment(ax1, struct, moving_atom_idx, env_data)
+            
+            # Right panel: Analysis plots
+            gs = fig.add_gridspec(3, 2, left=0.55, right=0.95, top=0.95, bottom=0.05)
+            
+            # Coordination evolution (up to current image)
+            ax2 = fig.add_subplot(gs[0, :])
+            self._plot_partial_evolution(ax2, environment_data[:i+1], 
+                                        rel_energies[:i+1] if rel_energies else None,
+                                        current_idx=i)
+            
+            # Bond length distribution
+            ax3 = fig.add_subplot(gs[1, 0])
+            self._plot_current_bonds(ax3, env_data)
+            
+            # Key metrics
+            ax4 = fig.add_subplot(gs[1, 1])
+            self._plot_key_metrics(ax4, env_data, rel_energies[i] if rel_energies else None)
+            
+            # Progress bar
+            ax5 = fig.add_subplot(gs[2, :])
+            self._plot_progress_bar(ax5, i, len(structures)-1)
+            
+            plt.suptitle(f'Oxygen Migration Analysis - Image {i}', 
+                        fontsize=16, fontweight='bold')
+            plt.savefig(frame_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            frame_paths.append(frame_path)
+            logger.debug(f"Created frame {i}: {frame_path}")
+        
+        logger.info(f"Created {len(frame_paths)} animation frames in {output_dir}")
+        return frame_paths
+    
+    def _plot_3d_environment(self, ax, structure: Structure, atom_idx: int, env_data: Dict):
+        """Helper to plot 3D environment view."""
+        coord_info = env_data['coordination']
+        center_pos = structure[atom_idx].coords
+        
+        # Plot central oxygen
+        ax.scatter(center_pos[0], center_pos[1], center_pos[2],
+                  s=300, c='red', alpha=0.8, edgecolor='black')
+        
+        # Plot neighbors
+        for neighbor in coord_info['neighbors']:
+            n_idx = neighbor['index']
+            n_pos = structure[n_idx].coords
+            n_element = neighbor['element']
+            
+            color = self.element_colors.get(n_element, 'gray')
+            ax.scatter(n_pos[0], n_pos[1], n_pos[2],
+                      s=150, c=color, alpha=0.6, edgecolor='black')
+            
+            # Draw bond
+            ax.plot([center_pos[0], n_pos[0]], 
+                   [center_pos[1], n_pos[1]], 
+                   [center_pos[2], n_pos[2]], 'k-', alpha=0.4)
+        
+        ax.set_title(f'3D Environment (CN={coord_info["coordination_number"]})')
+        ax.set_xlabel('X (Å)')
+        ax.set_ylabel('Y (Å)')
+        ax.set_zlabel('Z (Å)')
+    
+    def _plot_partial_evolution(self, ax, env_data_partial: List[Dict], 
+                               energies_partial: List[float] = None, current_idx: int = 0):
+        """Helper to plot evolution up to current point."""
+        images = [env['image'] for env in env_data_partial]
+        coord_numbers = [env['geometry']['coordination_number'] for env in env_data_partial]
+        
+        ax.plot(images, coord_numbers, 'bo-', linewidth=2, markersize=6)
+        ax.plot(current_idx, coord_numbers[-1], 'ro', markersize=10, label='Current')
+        
+        if energies_partial:
+            ax2 = ax.twinx()
+            ax2.plot(images, energies_partial, 'r--', alpha=0.7, label='Energy')
+            ax2.set_ylabel('Relative Energy (eV)', color='red')
+        
+        ax.set_xlabel('Image')
+        ax.set_ylabel('Coordination Number', color='blue')
+        ax.set_title('Evolution Progress')
+        ax.grid(True, alpha=0.3)
+    
+    def _plot_current_bonds(self, ax, env_data: Dict):
+        """Helper to plot current bond lengths."""
+        bond_lengths = env_data['coordination']['bond_lengths']
+        neighbor_types = env_data['coordination']['neighbor_types']
+        
+        if bond_lengths:
+            ax.hist(bond_lengths, bins=min(10, len(bond_lengths)), alpha=0.7, color='skyblue')
+            ax.axvline(env_data['coordination']['average_bond_length'], 
+                      color='red', linestyle='--', label='Average')
+            ax.set_xlabel('Bond Length (Å)')
+            ax.set_ylabel('Count')
+            ax.set_title('Current Bond Distribution')
+            ax.legend()
+        
+    def _plot_key_metrics(self, ax, env_data: Dict, energy: float = None):
+        """Helper to plot key metrics."""
+        ax.axis('off')
+        
+        coord_info = env_data['coordination']
+        geom_info = env_data['geometry']
+        
+        metrics_text = f"Coordination: {geom_info['coordination_number']}\n"
+        metrics_text += f"Geometry: {geom_info['geometry_type']}\n"
+        metrics_text += f"Avg Bond: {coord_info['average_bond_length']:.3f} Å\n"
+        metrics_text += f"Bond Range: {coord_info['min_bond_length']:.3f}-{coord_info['max_bond_length']:.3f} Å\n"
+        
+        if energy is not None:
+            metrics_text += f"Energy: {energy:.3f} eV\n"
+        
+        distortion = geom_info.get('bond_distortion_index', 0)
+        metrics_text += f"Distortion: {distortion:.4f}\n"
+        
+        # Neighbor types
+        neighbor_types = coord_info['neighbor_types']
+        metrics_text += f"\nNeighbors:\n"
+        for element, count in neighbor_types.items():
+            metrics_text += f"  {element}: {count}\n"
+        
+        ax.text(0.1, 0.9, metrics_text, transform=ax.transAxes,
+               fontsize=10, verticalalignment='top',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    def _plot_progress_bar(self, ax, current: int, total: int):
+        """Helper to plot progress bar."""
+        progress = current / total if total > 0 else 0
+        
+        ax.barh(0, progress, height=0.5, color='green', alpha=0.7)
+        ax.barh(0, 1-progress, left=progress, height=0.5, color='lightgray', alpha=0.7)
+        
+        ax.set_xlim(0, 1)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_xlabel(f'Progress: {current}/{total} ({progress*100:.1f}%)')
+        ax.set_yticks([])
+        ax.set_title('Migration Progress')
+    
+    def plot_energy_structure_landscape(self, environment_data: List[Dict],
+                                      energies: List[float],
+                                      landscape_features: Dict,
+                                      output_path: str = None) -> str:
+        """
+        Create comprehensive energy-structure landscape plot.
+        
+        Args:
+            environment_data: Environment analysis data
+            energies: Energy values
+            landscape_features: Landscape analysis results
+            output_path: Output file path
+            
+        Returns:
+            Path to saved plot
+        """
+        fig = plt.figure(figsize=(16, 12))
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        
+        images = [env['image'] for env in environment_data]
+        rel_energies = [e - energies[0] for e in energies]
+        
+        # Main energy profile
+        ax_main = fig.add_subplot(gs[0, :])
+        ax_main.plot(images, rel_energies, 'o-', linewidth=3, markersize=8, color='darkblue')
+        
+        # Highlight key points
+        key_points = landscape_features['key_points']
+        for point_type, point_data in key_points.items():
+            if isinstance(point_data, dict):
+                idx = point_data['image']
+                energy = point_data['energy']
+                if point_type == 'initial':
+                    ax_main.plot(idx, energy, 'o', markersize=12, color='green', label='Initial')
+                elif point_type == 'transition_state':
+                    ax_main.plot(idx, energy, 'o', markersize=12, color='red', label='TS')
+                elif point_type == 'final':
+                    ax_main.plot(idx, energy, 'o', markersize=12, color='blue', label='Final')
+        
+        ax_main.set_ylabel('Relative Energy (eV)', fontsize=12)
+        ax_main.set_title('Energy Profile with Key Points', fontsize=14, fontweight='bold')
+        ax_main.grid(True, alpha=0.3)
+        ax_main.legend()
+        
+        # Coordination evolution
+        ax1 = fig.add_subplot(gs[1, 0])
+        coord_numbers = [env['geometry']['coordination_number'] for env in environment_data]
+        ax1.plot(images, coord_numbers, 's-', color='purple', linewidth=2, markersize=6)
+        ax1.set_ylabel('Coordination Number')
+        ax1.set_xlabel('Image')
+        ax1.set_title('Coordination Evolution')
+        ax1.grid(True, alpha=0.3)
+        
+        # Bond length evolution
+        ax2 = fig.add_subplot(gs[1, 1])
+        avg_bonds = [env['coordination']['average_bond_length'] for env in environment_data]
+        bond_stds = [env['geometry'].get('bond_length_std', 0) for env in environment_data]
+        ax2.errorbar(images, avg_bonds, yerr=bond_stds, fmt='o-', 
+                    color='orange', linewidth=2, capsize=5)
+        ax2.set_ylabel('Average Bond Length (Å)')
+        ax2.set_xlabel('Image')
+        ax2.set_title('Bond Length Evolution')
+        ax2.grid(True, alpha=0.3)
+        
+        # Distortion evolution
+        ax3 = fig.add_subplot(gs[1, 2])
+        distortions = [env['geometry'].get('bond_distortion_index', 0) for env in environment_data]
+        ax3.plot(images, distortions, '^-', color='red', linewidth=2, markersize=6)
+        ax3.set_ylabel('Bond Distortion Index')
+        ax3.set_xlabel('Image')
+        ax3.set_title('Geometry Distortion')
+        ax3.grid(True, alpha=0.3)
+        
+        # Correlation matrix
+        ax4 = fig.add_subplot(gs[2, 0])
+        corr_data = np.array([
+            rel_energies,
+            coord_numbers,
+            avg_bonds,
+            distortions
+        ])
+        corr_matrix = np.corrcoef(corr_data)
+        
+        im = ax4.imshow(corr_matrix, cmap='RdBu', vmin=-1, vmax=1)
+        ax4.set_xticks(range(4))
+        ax4.set_yticks(range(4))
+        ax4.set_xticklabels(['Energy', 'CN', 'Bond Len', 'Distortion'], rotation=45)
+        ax4.set_yticklabels(['Energy', 'CN', 'Bond Len', 'Distortion'])
+        ax4.set_title('Correlation Matrix')
+        
+        # Add correlation values
+        for i in range(4):
+            for j in range(4):
+                ax4.text(j, i, f'{corr_matrix[i,j]:.2f}', 
+                        ha='center', va='center', color='white' if abs(corr_matrix[i,j]) > 0.5 else 'black')
+        
+        plt.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
+        
+        # Summary statistics
+        ax5 = fig.add_subplot(gs[2, 1:])
+        ax5.axis('off')
+        
+        summary_text = "ENERGY LANDSCAPE ANALYSIS\n"
+        summary_text += "=" * 30 + "\n\n"
+        summary_text += f"Activation Energy: {landscape_features['activation_energy']:.3f} eV\n"
+        summary_text += f"Reaction Energy: {landscape_features['reaction_energy']:.3f} eV\n"
+        summary_text += f"Barrier Asymmetry: {landscape_features['barrier_asymmetry']:.3f}\n"
+        summary_text += f"Energy Roughness: {landscape_features['energy_profile_roughness']:.3f} eV\n\n"
+        
+        # Key points summary
+        summary_text += "KEY POINTS:\n"
+        for point_type, point_data in key_points.items():
+            if isinstance(point_data, dict):
+                summary_text += f"{point_data['label']}: CN={point_data['coordination_number']}, "
+                summary_text += f"E={point_data['energy']:.3f} eV\n"
+        
+        # Correlations
+        summary_text += f"\nCORRELATIONS:\n"
+        summary_text += f"CN vs Energy: {np.corrcoef(coord_numbers, rel_energies)[0,1]:.3f}\n"
+        summary_text += f"Bond Length vs Energy: {np.corrcoef(avg_bonds, rel_energies)[0,1]:.3f}\n"
+        summary_text += f"Distortion vs Energy: {np.corrcoef(distortions, rel_energies)[0,1]:.3f}\n"
+        
+        ax5.text(0.05, 0.95, summary_text, transform=ax5.transAxes,
+                fontsize=11, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
+        plt.suptitle('Oxygen Migration: Energy-Structure Landscape', 
+                    fontsize=16, fontweight='bold')
+        
+        if output_path is None:
+            output_path = "energy_structure_landscape.png"
+        
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+
+
+class OxygenMigrationWorkflow:
+    """
+    Complete workflow for analyzing oxygen migration in NEB calculations.
+    """
+    
+    def __init__(self, cutoff_radius: float = 3.5):
+        """
+        Initialize the complete workflow.
+        
+        Args:
+            cutoff_radius: Cutoff radius for neighbor detection
+        """
+        self.analyzer = OxygenEnvironmentAnalyzer(cutoff_radius)
+        self.visualizer = OxygenPathwayVisualizer(self.analyzer)
+        
+    def run_complete_analysis(self, neb_dir: str, n_images: int, 
+                            moving_atom_idx: int, output_dir: str = None,
+                            file_manager=None) -> Dict[str, Any]:
+        """
+        Run complete oxygen migration analysis.
+        
+        Args:
+            neb_dir: NEB calculation directory
+            n_images: Number of intermediate images
+            moving_atom_idx: Index of moving oxygen atom
+            output_dir: Output directory for all results
+            file_manager: FileManager instance for CONTCAR cleaning
+            
+        Returns:
+            Dictionary with all analysis results and file paths
+        """
+        if output_dir is None:
+            output_dir = os.path.join(neb_dir, "oxygen_analysis")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        logger.info(f"Starting complete oxygen migration analysis")
+        logger.info(f"NEB directory: {neb_dir}")
+        logger.info(f"Moving atom index: {moving_atom_idx}")
+        logger.info(f"Output directory: {output_dir}")
+        
+        results = {
+            'analysis_data': {},
+            'visualizations': {},
+            'reports': {},
+            'summary': {}
+        }
+        
+        try:
+            # Load structures
+            structures = self._load_neb_structures(neb_dir, n_images, file_manager)
+            if not structures:
+                logger.error("Failed to load NEB structures")
+                return results
+            
+            # Load energies
+            energies = self._load_energies(neb_dir, n_images)
+            if not energies:
+                logger.warning("Could not load energies - analysis will be limited")
+            
+            # Environment analysis
+            logger.info("Analyzing coordination environments...")
+            environment_data = self.analyzer.track_environment_changes(structures, moving_atom_idx)
+            results['analysis_data']['environment'] = environment_data
+            
+            if energies:
+                # Correlation analysis
+                logger.info("Analyzing structure-energy correlations...")
+                correlations = self.analyzer.correlate_with_energy(environment_data, energies)
+                results['analysis_data']['correlations'] = correlations
+                
+                # Landscape analysis
+                logger.info("Analyzing energy landscape features...")
+                landscape_features = self.analyzer.analyze_energy_landscape_features(environment_data, energies)
+                results['analysis_data']['landscape'] = landscape_features
+                
+                # Generate comprehensive report
+                logger.info("Generating analysis report...")
+                report_path = self.analyzer.save_analysis_report(
+                    environment_data, energies, correlations, landscape_features,
+                    os.path.join(output_dir, "oxygen_migration_report.txt")
+                )
+                results['reports']['main_report'] = report_path
+            
+            # Create visualizations
+            logger.info("Creating visualizations...")
+            
+            # Coordination evolution plot
+            coord_plot = self.visualizer.plot_coordination_evolution(
+                environment_data, energies,
+                os.path.join(output_dir, "coordination_evolution.png")
+            )
+            results['visualizations']['coordination_evolution'] = coord_plot
+            
+            # Bond distribution plot
+            bond_plot = self.visualizer.plot_bond_distribution(
+                environment_data,
+                os.path.join(output_dir, "bond_distribution.png")
+            )
+            results['visualizations']['bond_distribution'] = bond_plot
+            
+            if energies and 'correlations' in results['analysis_data']:
+                # Correlation analysis plot
+                corr_plot = self.visualizer.plot_correlation_analysis(
+                    correlations,
+                    os.path.join(output_dir, "correlation_analysis.png")
+                )
+                results['visualizations']['correlation_analysis'] = corr_plot
+                
+                # Energy-structure landscape plot
+                landscape_plot = self.visualizer.plot_energy_structure_landscape(
+                    environment_data, energies, landscape_features,
+                    os.path.join(output_dir, "energy_structure_landscape.png")
+                )
+                results['visualizations']['landscape'] = landscape_plot
+            
+            # Environment snapshots for key images
+            logger.info("Creating environment snapshots...")
+            snapshot_dir = os.path.join(output_dir, "snapshots")
+            os.makedirs(snapshot_dir, exist_ok=True)
+            
+            # Always include first, last, and middle images
+            key_images = [0, len(structures)//2, len(structures)-1]
+            
+            # Add transition state if energies available
+            if energies:
+                ts_idx = np.argmax([e - energies[0] for e in energies])
+                if ts_idx not in key_images:
+                    key_images.append(ts_idx)
+            
+            snapshot_paths = {}
+            for img_idx in sorted(key_images):
+                coord_info = environment_data[img_idx]['coordination']
+                for projection in ['xy', 'xz']:  # Create two main projections
+                    snapshot_path = self.visualizer.plot_environment_snapshot(
+                        structures[img_idx], moving_atom_idx, coord_info, img_idx,
+                        projection=projection,
+                        output_path=os.path.join(snapshot_dir, f"snapshot_img{img_idx:02d}_{projection}.png")
+                    )
+                    snapshot_paths[f'img_{img_idx}_{projection}'] = snapshot_path
+            
+            results['visualizations']['snapshots'] = snapshot_paths
+            
+            # Create animation frames if requested
+            logger.info("Creating animation frames...")
+            frames_dir = os.path.join(output_dir, "animation_frames")
+            frame_paths = self.visualizer.create_environment_movie_frames(
+                structures, moving_atom_idx, environment_data, energies, frames_dir
+            )
+            results['visualizations']['animation_frames'] = frame_paths
+            
+            # Generate summary
+            logger.info("Generating summary...")
+            summary = self._generate_summary(environment_data, energies, 
+                                           results['analysis_data'].get('landscape', {}))
+            results['summary'] = summary
+            
+            # Save summary to file
+            summary_path = os.path.join(output_dir, "analysis_summary.json")
+            with open(summary_path, 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+            results['reports']['summary_json'] = summary_path
+            
+            logger.info(f"Complete analysis finished successfully!")
+            logger.info(f"Results saved to: {output_dir}")
+            
+        except Exception as e:
+            logger.error(f"Error in oxygen migration analysis: {e}")
+            results['error'] = str(e)
+        
+        return results
+    
+    def _load_neb_structures(self, neb_dir: str, n_images: int, file_manager=None) -> List[Structure]:
+        """Load NEB structures from directory."""
+        structures = []
+        
+        for i in range(n_images + 2):
+            img_dir = os.path.join(neb_dir, f"{i:02d}")
+            
+            # Try CONTCAR first, then POSCAR
+            for filename in ["CONTCAR", "POSCAR"]:
+                filepath = os.path.join(img_dir, filename)
+                
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    try:
+                        # Clean CONTCAR if needed
+                        if filename == "CONTCAR" and file_manager:
+                            logger.debug(f"Cleaning {filename} for image {i:02d}")
+                            file_manager.clean_contcar_elements(filepath)
+                        
+                        structure = Structure.from_file(filepath)
+                        structures.append(structure)
+                        logger.debug(f"Loaded structure from {filepath}")
+                        break
+                        
+                    except Exception as e:
+                        logger.warning(f"Error loading {filepath}: {e}")
+                        continue
+            else:
+                logger.error(f"No valid structure found for image {i:02d}")
+                return []
+        
+        logger.info(f"Loaded {len(structures)} NEB structures")
+        return structures
+    
+    def _load_energies(self, neb_dir: str, n_images: int) -> List[float]:
+        """Load energies from NEB calculation."""
+        energies = []
+        
+        # Try to load from NEBEF.dat first
+        nebef_path = os.path.join(neb_dir, "NEBEF.dat")
+        if os.path.exists(nebef_path):
+            try:
+                data = np.loadtxt(nebef_path)
+                if data.ndim == 2 and data.shape[1] >= 2:
+                    energies = data[:, 1].tolist()
+                    logger.info(f"Loaded {len(energies)} energies from NEBEF.dat")
+                    return energies
+            except Exception as e:
+                logger.warning(f"Error reading NEBEF.dat: {e}")
+        
+        # Fallback: read from OUTCAR files
+        try:
+            from pymatgen.io.vasp.outputs import Outcar
+            
+            for i in range(n_images + 2):
+                img_dir = os.path.join(neb_dir, f"{i:02d}")
+                outcar_path = os.path.join(img_dir, "OUTCAR")
+                
+                if os.path.exists(outcar_path):
+                    try:
+                        outcar = Outcar(outcar_path)
+                        if hasattr(outcar, "final_energy"):
+                            energies.append(outcar.final_energy)
+                        else:
+                            logger.warning(f"No final_energy found in {outcar_path}")
+                            energies.append(None)
+                    except Exception as e:
+                        logger.warning(f"Error reading {outcar_path}: {e}")
+                        energies.append(None)
+                else:
+                    logger.warning(f"OUTCAR not found at {outcar_path}")
+                    energies.append(None)
+            
+            # Remove None values and check if we have enough data
+            valid_energies = [e for e in energies if e is not None]
+            if len(valid_energies) >= len(energies) * 0.8:  # At least 80% valid
+                # Interpolate missing values if needed
+                final_energies = []
+                for i, e in enumerate(energies):
+                    if e is not None:
+                        final_energies.append(e)
+                    else:
+                        # Simple interpolation
+                        if i > 0 and i < len(energies) - 1:
+                            prev_e = next((energies[j] for j in range(i-1, -1, -1) if energies[j] is not None), None)
+                            next_e = next((energies[j] for j in range(i+1, len(energies)) if energies[j] is not None), None)
+                            if prev_e is not None and next_e is not None:
+                                final_energies.append((prev_e + next_e) / 2)
+                            elif prev_e is not None:
+                                final_energies.append(prev_e)
+                            elif next_e is not None:
+                                final_energies.append(next_e)
+                            else:
+                                final_energies.append(0.0)
+                        else:
+                            final_energies.append(0.0)
+                
+                logger.info(f"Loaded {len(final_energies)} energies from OUTCAR files")
+                return final_energies
+            
+        except ImportError:
+            logger.warning("pymatgen not available for reading OUTCAR files")
+        except Exception as e:
+            logger.warning(f"Error loading energies from OUTCAR: {e}")
+        
+        logger.warning("Could not load energies")
+        return []
+    
+    def _generate_summary(self, environment_data: List[Dict], energies: List[float],
+                         landscape_features: Dict) -> Dict:
+        """Generate analysis summary."""
+        summary = {
+            'total_images': len(environment_data),
+            'analysis_timestamp': str(pd.Timestamp.now()),
+            'coordination_summary': {},
+            'energy_summary': {},
+            'key_findings': []
+        }
+        
+        # Coordination summary
+        coord_numbers = [env['geometry']['coordination_number'] for env in environment_data]
+        avg_bonds = [env['coordination']['average_bond_length'] for env in environment_data]
+        
+        summary['coordination_summary'] = {
+            'initial_cn': coord_numbers[0],
+            'final_cn': coord_numbers[-1],
+            'max_cn': max(coord_numbers),
+            'min_cn': min(coord_numbers),
+            'cn_changes': len(set(coord_numbers)),
+            'initial_avg_bond': avg_bonds[0],
+            'final_avg_bond': avg_bonds[-1],
+            'bond_length_range': (min(avg_bonds), max(avg_bonds))
+        }
+        
+        # Energy summary
+        if energies:
+            rel_energies = [e - energies[0] for e in energies]
+            summary['energy_summary'] = {
+                'activation_energy': landscape_features.get('activation_energy', 0),
+                'reaction_energy': landscape_features.get('reaction_energy', 0),
+                'transition_state_image': np.argmax(rel_energies),
+                'barrier_asymmetry': landscape_features.get('barrier_asymmetry', 1.0),
+                'energy_range': (min(rel_energies), max(rel_energies))
+            }
+        
+        # Key findings
+        findings = []
+        
+        # Coordination changes
+        if summary['coordination_summary']['initial_cn'] != summary['coordination_summary']['final_cn']:
+            findings.append(f"Coordination changes from {summary['coordination_summary']['initial_cn']} to {summary['coordination_summary']['final_cn']}")
+        
+        # Energy characteristics
+        if energies and landscape_features:
+            if landscape_features.get('activation_energy', 0) > 0.5:
+                findings.append(f"High activation barrier: {landscape_features['activation_energy']:.3f} eV")
+            elif landscape_features.get('activation_energy', 0) < 0.1:
+                findings.append(f"Low activation barrier: {landscape_features['activation_energy']:.3f} eV")
+            
+            if landscape_features.get('is_endothermic'):
+                findings.append(f"Endothermic reaction: ΔE = {landscape_features['reaction_energy']:.3f} eV")
+            else:
+                findings.append(f"Exothermic reaction: ΔE = {landscape_features['reaction_energy']:.3f} eV")
+        
+        # Bond length changes
+        bond_change = abs(summary['coordination_summary']['final_avg_bond'] - 
+                         summary['coordination_summary']['initial_avg_bond'])
+        if bond_change > 0.1:
+            findings.append(f"Significant bond length change: {bond_change:.3f} Å")
+        
+        summary['key_findings'] = findings
+        
+        return summary
+    
+    def quick_analysis(self, neb_dir: str, n_images: int, moving_atom_idx: int) -> Dict:
+        """
+        Quick analysis for immediate insights.
+        
+        Args:
+            neb_dir: NEB calculation directory
+            n_images: Number of intermediate images
+            moving_atom_idx: Index of moving oxygen atom
+            
+        Returns:
+            Dictionary with quick analysis results
+        """
+        logger.info("Running quick oxygen migration analysis...")
+        
+        # Load just the key structures (initial, transition state guess, final)
+        key_images = [0, n_images//2, n_images+1]
+        structures = []
+        
+        for i in key_images:
+            img_dir = os.path.join(neb_dir, f"{i:02d}")
+            for filename in ["CONTCAR", "POSCAR"]:
+                filepath = os.path.join(img_dir, filename)
+                if os.path.exists(filepath):
+                    try:
+                        structures.append(Structure.from_file(filepath))
+                        break
+                    except:
+                        continue
+        
+        if len(structures) < 3:
+            logger.error("Could not load enough structures for quick analysis")
+            return {}
+        
+        # Quick environment analysis
+        quick_results = {
+            'initial': {},
+            'middle': {},
+            'final': {},
+            'comparison': {}
+        }
+        
+        labels = ['initial', 'middle', 'final']
+        for i, (struct, label) in enumerate(zip(structures, labels)):
+            coord_info = self.analyzer.analyze_coordination(struct, moving_atom_idx)
+            geometry = self.analyzer.calculate_geometry_parameters(struct, moving_atom_idx, coord_info)
+            
+            quick_results[label] = {
+                'coordination_number': geometry['coordination_number'],
+                'geometry_type': geometry['geometry_type'],
+                'average_bond_length': coord_info['average_bond_length'],
+                'neighbor_types': dict(coord_info['neighbor_types']),
+                'bond_distortion': geometry.get('bond_distortion_index', 0)
+            }
+        
+        # Quick comparison
+        initial = quick_results['initial']
+        final = quick_results['final']
+        
+        quick_results['comparison'] = {
+            'cn_change': final['coordination_number'] - initial['coordination_number'],
+            'bond_length_change': final['average_bond_length'] - initial['average_bond_length'],
+            'geometry_change': initial['geometry_type'] != final['geometry_type'],
+            'distortion_change': final['bond_distortion'] - initial['bond_distortion']
+        }
+        
+        logger.info("Quick analysis completed")
+        return quick_results
+
+
+# Convenience functions for easy integration
+def analyze_oxygen_migration(neb_dir: str, n_images: int, moving_atom_idx: int,
+                           output_dir: str = None, file_manager=None) -> Dict:
+    """
+    Convenience function to run complete oxygen migration analysis.
+    
+    Args:
+        neb_dir: NEB calculation directory
+        n_images: Number of intermediate images
+        moving_atom_idx: Index of moving oxygen atom
+        output_dir: Output directory for results
+        file_manager: FileManager instance for CONTCAR cleaning
+        
+    Returns:
+        Dictionary with all analysis results
+    """
+    workflow = OxygenMigrationWorkflow()
+    return workflow.run_complete_analysis(neb_dir, n_images, moving_atom_idx, 
+                                        output_dir, file_manager)
+
+def quick_oxygen_analysis(neb_dir: str, n_images: int, moving_atom_idx: int) -> Dict:
+    """
+    Convenience function for quick oxygen migration analysis.
+    
+    Args:
+        neb_dir: NEB calculation directory
+        n_images: Number of intermediate images
+        moving_atom_idx: Index of moving oxygen atom
+        
+    Returns:
+        Dictionary with quick analysis results
+    """
+    workflow = OxygenMigrationWorkflow()
+    return workflow.quick_analysis(neb_dir, n_images, moving_atom_idx)
+
+
+if __name__ == "__main__":
+    # Example usage
+    import logging
+    logging.basicConfig(level=logging.INFO, 
+                       format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    print("Oxygen Migration Environment Analyzer")
+    print("=" * 40)
+    print("This module provides comprehensive analysis of oxygen migration:")
+    print("- Coordination environment tracking")
+    print("- Energy-structure correlations")
+    print("- Transition state characterization")
+    print("- Bond length and angle analysis")
+    print("- Comprehensive visualizations")
+    print("\nExample usage:")
+    print("  results = analyze_oxygen_migration('neb_dir', 5, 51)")
+    print("  quick_results = quick_oxygen_analysis('neb_dir', 5, 51)")
+    print("\nKey outputs:")
+    print("- Environment evolution plots")
+    print("- Structure-energy correlation analysis")
+    print("- Animation frames for pathway visualization")
+    print("- Comprehensive analysis reports")
+    print("- Summary statistics and key findings")
