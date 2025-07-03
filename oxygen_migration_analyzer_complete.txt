@@ -426,7 +426,7 @@ class OxygenEnvironmentAnalyzer:
             environment_data.append(env_data)
             
         return environment_data
-    def correlate_with_energy_fixed(self, environment_data: List[Dict],
+    def correlate_with_energy(self, environment_data: List[Dict],
                                    energies: List[float]) -> Dict:
         """
         Fixed version with better error handling.
