@@ -151,8 +151,8 @@ class MultiStageNEB:
                 }
             },
             'stage3': {
-                'name': 'Final Convergence',
-                'description': 'Tight convergence for final barrier',
+                'name': 'Final Convergence 1st',
+                'description': '1st Tight convergence for final barrier',
                 'dir': 'neb_stage3',
                 'incar_override': {
                     # NEB specific settings
@@ -164,12 +164,12 @@ class MultiStageNEB:
                     'POTIM': 0.05,    # Small step size for final convergence
                     'IOPT': 0,
                     'EDIFFG': -0.01,  # Tight force convergence
-                    'NSW': 200,       # Maximum ionic steps
+                    'NSW': 100,       # Maximum ionic steps
                     'ISIF': 2,        # Relax ions only
                     
                     # Electronic structure settings
                     'EDIFF': 1E-6,
-                    'NELM': 199,
+                    'NELM': 100,
                     'ALGO': 'Fast',   # Fast algorithm for final stage
                     'PREC': 'Accurate',
                     'LSCALAPACK': True,
@@ -189,9 +189,47 @@ class MultiStageNEB:
                 }
             },
             'stage4': {
+                'name': '2nd Final Convergence',
+                'description': '2nd Tight convergence for final barrier',
+                'dir': 'neb_stage4',
+                'incar_override': {
+                    # NEB specific settings
+                    'IMAGES': None,   # Will be set based on n_images
+                    'LCLIMB': True,   # Enable climbing image
+                    'ICHAIN': 0,
+                    'SPRING': -5,     # Negative spring for climbing image
+                    'IBRION': 1,      # Use DIIS quasi-Newton
+                    'POTIM': 0.05,    # Small step size for final convergence
+                    'IOPT': 0,
+                    'EDIFFG': -0.01,  # Tight force convergence
+                    'NSW': 100,       # Maximum ionic steps
+                    'ISIF': 2,        # Relax ions only
+                    
+                    # Electronic structure settings
+                    'EDIFF': 1E-6,
+                    'NELM': 100,
+                    'ALGO': 'Fast',   # Fast algorithm for final stage
+                    'PREC': 'Accurate',
+                    'LSCALAPACK': True,
+                    'LSCALU' : False,
+                    'NCORE': 16,
+                    'ISMEAR': 0,
+                    'SIGMA': 0.05,
+                    'LASPH': True,
+                    'LREAL': 'False',
+                    'LMAXMIX': 6,
+                    'ENCUT': 600,
+                    
+                    # Large system parallelization
+                    #'LPLANE': True,
+                    #'NPAR': 4,        # Most aggressive for final stage
+                    #'NSIM': 4
+                }
+            },
+            'stage5': {
                 'name': 'Ultra-Fine Convergence',
                 'description': 'Ultra-tight convergence for publication quality',
-                'dir': 'neb_stage4',
+                'dir': 'neb_stage5',
                 'incar_override': {
                     # NEB specific settings
                     'IMAGES': None,
@@ -225,43 +263,6 @@ class MultiStageNEB:
                     'NSIM': 4
                 }
             },
-            'stage5': {
-                'name': 'Production Quality',
-                'description': 'Production-level convergence with maximum accuracy',
-                'dir': 'neb_stage5',
-                'incar_override': {
-                    # NEB specific settings
-                    'IMAGES': None,
-                    'LCLIMB': True,
-                    'ICHAIN': 0,
-                    'SPRING': -5,
-                    'IBRION': 1,
-                    'POTIM': 0.01,    # Extremely small step size
-                    'IOPT': 0,
-                    'EDIFFG': -0.002, # Production-level force convergence
-                    'NSW': 400,
-                    'ISIF': 2,
-                    
-                    # Electronic structure settings
-                    'EDIFF': 1E-8,    # Very tight electronic convergence
-                    'NELM': 199,
-                    'ALGO': 'Normal',
-                    'PREC': 'Accurate',
-                    'LSCALAPACK': False,
-                    'NCORE': 16,
-                    'ISMEAR': 0,
-                    'SIGMA': 0.05,
-                    'LASPH': True,
-                    'LREAL': 'Auto',
-                    'LMAXMIX': 6,
-                    'ENCUT': 700,     # Higher cutoff for final accuracy
-                    
-                    # Large system parallelization
-                    'LPLANE': True,
-                    'NPAR': 4,
-                    'NSIM': 4
-                }
-            }
         }
     
     def _select_stages(self, n_stages: int) -> List[str]:
@@ -269,7 +270,7 @@ class MultiStageNEB:
         Select which stages to use based on n_stages.
         
         Args:
-            n_stages: Number of stages (2, 3, or 5)
+            n_stages: Number of stages (2, 3, 4 or 5)
             
         Returns:
             List of stage keys to use
@@ -278,10 +279,12 @@ class MultiStageNEB:
             return ['stage1', 'stage3']  # Rough → Final
         elif n_stages == 3:
             return ['stage1', 'stage2', 'stage3']  # Rough → Climbing → Final
+        elif n_stages == 4:
+            return ['stage1', 'stage2', 'stage3', 'stage4']  # Rough → Climbing → 1st Final → 2nd Final
         elif n_stages == 5:
             return ['stage1', 'stage2', 'stage3', 'stage4', 'stage5']  # All stages
         else:
-            raise ValueError(f"Unsupported number of stages: {n_stages}. Use 2, 3, or 5.")
+            raise ValueError(f"Unsupported number of stages: {n_stages}. Use 2, 3, 4, or 5.")
     
     def setup_multistage_neb(self, initial_struct: Structure, final_struct: Structure,
                             n_images: int = 5, n_stages: int = 3,
@@ -297,7 +300,7 @@ class MultiStageNEB:
             initial_struct: Initial structure
             final_struct: Final structure
             n_images: Number of NEB images
-            n_stages: Number of stages (2, 3, or 5)
+            n_stages: Number of stages (2, 3, 4, or 5)
             moving_atom_idx: Index of moving atom
             ldau_settings: LDAU parameters
             existing_neb_dir: Directory with existing NEB path
