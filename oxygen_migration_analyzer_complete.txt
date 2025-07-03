@@ -1316,7 +1316,7 @@ class OxygenMigrationWorkflow:
         """
         self.analyzer = OxygenEnvironmentAnalyzer(cutoff_radius)
         self.visualizer = OxygenPathwayVisualizer(self.analyzer)
-    def run_complete_analysis_fixed(self, neb_dir: str, n_images: int, 
+    def run_complete_analysis(self, neb_dir: str, n_images: int, 
                                   moving_atom_idx: int, output_dir: str = None,
                                   file_manager=None, 
                                   initial_relax_dir: str = None, 
