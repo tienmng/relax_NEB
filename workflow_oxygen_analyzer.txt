@@ -1,0 +1,66 @@
+#!/usr/bin/env python
+"""
+Example integration with your existing NEB workflow
+"""
+
+# Your existing imports
+import sys
+import os
+print("Initializing components...")
+module_dir = os.path.abspath(os.path.join(os.getcwd(), '/nfs/home/6/nguyenm/pymatgen-packages/relax_NEB'))
+if module_dir not in sys.path:
+    sys.path.insert(0, module_dir)
+    print(f"Added {module_dir} to Python path")
+from file_manager import FileManager
+from vasp_inputs import VASPInputGenerator
+from structure_analyzer import StructureAnalyzer
+from slurm_manager import SLURMManager
+from multistage_relaxation import MultiStageStructureRelaxer
+from neb_path_generation_with_constraint_control import NEBPathGenerator
+from energy_analyzer import NEBEnergyAnalyzer
+from neb_multistage import MultiStageNEB
+from file_manager import FileManager
+from energy_analyzer import NEBEnergyAnalyzer
+
+# Add the oxygen migration analyzer
+from oxygen_migration_analyzer_complete import analyze_oxygen_migration, quick_oxygen_analysis
+
+# Your existing configuration
+potcar_path = "/nfs/home/6/nguyenm/sensor/POTCAR-files/potpaw_PBE_54"
+potcar_mapping = {
+    "O": "O_s", "La": "La", "Ni": "Ni_pv", "V": "V_sv",
+    "Fe": "Fe_pv", "Co": "Co_pv", "Mn": "Mn_pv"
+}
+
+# Parameters
+neb_dir = "./multistage_neb/neb_stage3"
+n_images = 5
+moving_o_idx = 51
+
+# Initialize file manager
+file_manager = FileManager(potcar_path, potcar_mapping)
+
+print("Running oxygen migration environment analysis...")
+
+# Run complete analysis
+results = analyze_oxygen_migration(
+    neb_dir=neb_dir,
+    n_images=n_images,
+    moving_atom_idx=moving_o_idx,
+    output_dir="./oxygen_analysis",
+    file_manager=file_manager
+)
+
+# Check results
+if 'error' in results:
+    print(f"Error in analysis: {results['error']}")
+else:
+    print("Analysis completed successfully!")
+    print(f"Generated {len(results['visualizations'])} visualizations")
+    print(f"Reports saved to: {results['reports']}")
+    
+    # Print key findings
+    if results['summary']['key_findings']:
+        print("\nKey Findings:")
+        for finding in results['summary']['key_findings']:
+            print(f"  - {finding}")
