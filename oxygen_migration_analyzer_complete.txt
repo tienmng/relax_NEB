@@ -146,20 +146,28 @@ class OxygenEnvironmentAnalyzer:
                 changes[element] = {'from': count1, 'to': count2, 'change': count2 - count1}
         
         return changes
+    def _empty_coordination_info(self) -> Dict:
+        """Return empty coordination info structure."""
+        return {
+            'coordination_number': 0,
+            'neighbors': [],
+            'bond_lengths': [],
+            'neighbor_types': defaultdict(int),
+            'average_bond_length': 0.0,
+            'min_bond_length': float('inf'),
+            'max_bond_length': 0.0
+        }
 
     def analyze_coordination(self, structure: Structure, atom_idx: int, 
                            method: str = 'crystal') -> Dict:
         """
-        Analyze coordination environment of an atom.
-        
-        Args:
-            structure: Crystal structure
-            atom_idx: Index of atom to analyze
-            method: Method for neighbor detection ('crystal', 'voronoi', 'distance')
-            
-        Returns:
-            Dictionary with coordination information
+        Analyze coordination environment of an atom with better error handling.
         """
+        # Validate inputs
+        if atom_idx < 0 or atom_idx >= len(structure):
+            logger.error(f"Invalid atom index {atom_idx} for structure with {len(structure)} atoms")
+            return self._empty_coordination_info()
+        
         if method == 'crystal':
             nn_finder = self.cnn
         elif method == 'voronoi':
@@ -208,10 +216,19 @@ class OxygenEnvironmentAnalyzer:
                 coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
                 coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
                 
-        except Exception as e:
-            logger.warning(f"Error analyzing coordination: {e}")
-            # Fallback to simple distance-based analysis
-            coord_info = self._simple_coordination_analysis(structure, atom_idx)
+        except Exception as e:  
+            logger.warning(f"Error analyzing coordination with {method}: {e}")
+            # Try alternative methods before falling back
+            if method == 'crystal':
+                logger.info("Trying Voronoi method...")
+                return self.analyze_coordination(structure, atom_idx, 'voronoi')
+            elif method == 'voronoi':
+                logger.info("Trying distance method...")
+                return self.analyze_coordination(structure, atom_idx, 'distance')
+            else:
+                # Final fallback
+                return self._simple_coordination_analysis(structure, atom_idx)
+
             
         return coord_info
     
@@ -409,14 +426,28 @@ class OxygenEnvironmentAnalyzer:
             environment_data.append(env_data)
             
         return environment_data
-    def correlate_with_energy(self, environment_data: List[Dict],
-                                 energies: List[float]) -> Dict:
+    def correlate_with_energy_fixed(self, environment_data: List[Dict],
+                                   energies: List[float]) -> Dict:
         """
-        Improved correlation analysis with better transition state identification.
+        Fixed version with better error handling.
         """
+        if not environment_data or not energies:
+            logger.error("Missing environment data or energies")
+            return {
+                'coordination_energy': 0.0,
+                'bond_length_energy': 0.0,
+                'distortion_energy': 0.0,
+                'data': {},
+                'transitions': {'coordination_changes': [], 'transition_state': None}
+            }
+        
         if len(environment_data) != len(energies):
-            logger.error("Mismatch between environment data and energies")
-            return {}
+            logger.error(f"Mismatch: {len(environment_data)} env data vs {len(energies)} energies")
+            # Try to work with minimum length
+            min_len = min(len(environment_data), len(energies))
+            environment_data = environment_data[:min_len]
+            energies = energies[:min_len]
+            logger.warning(f"Truncating to {min_len} data points")
         
         # Extract key parameters (same as before)
         coord_numbers = [env['geometry']['coordination_number'] for env in environment_data]
@@ -1285,70 +1316,128 @@ class OxygenMigrationWorkflow:
         """
         self.analyzer = OxygenEnvironmentAnalyzer(cutoff_radius)
         self.visualizer = OxygenPathwayVisualizer(self.analyzer)
-    def run_complete_analysis(self, neb_dir: str, n_images: int, 
-                            moving_atom_idx: int, output_dir: str = None,
-                            file_manager=None, 
-                            initial_relax_dir: str = None, 
-                            final_relax_dir: str = None) -> Dict[str, Any]:
+    def run_complete_analysis_fixed(self, neb_dir: str, n_images: int, 
+                                  moving_atom_idx: int, output_dir: str = None,
+                                  file_manager=None, 
+                                  initial_relax_dir: str = None, 
+                                  final_relax_dir: str = None) -> Dict[str, Any]:
         """
-        Run complete oxygen migration analysis.
-        
-        Args:
-            neb_dir: NEB calculation directory
-            n_images: Number of intermediate images
-            moving_atom_idx: Index of moving oxygen atom
-            output_dir: Output directory for all results
-            file_manager: FileManager instance for CONTCAR cleaning
-            initial_relax_dir: Custom directory for initial state energy (e.g., "relax_initial/stage1")
-            final_relax_dir: Custom directory for final state energy (e.g., "relax_final/stage1")
-            
-        Returns:
-            Dictionary with all analysis results and file paths
+        Fixed version with better error handling.
         """
         if output_dir is None:
             output_dir = os.path.join(neb_dir, "oxygen_analysis")
         os.makedirs(output_dir, exist_ok=True)
         
         logger.info(f"Starting complete oxygen migration analysis")
-        logger.info(f"NEB directory: {neb_dir}")
-        logger.info(f"Moving atom index: {moving_atom_idx}")
-        logger.info(f"Output directory: {output_dir}")
-        if initial_relax_dir:
-            logger.info(f"Using custom initial state from: {initial_relax_dir}")
-        if final_relax_dir:
-            logger.info(f"Using custom final state from: {final_relax_dir}")
         
         results = {
             'analysis_data': {},
             'visualizations': {},
             'reports': {},
-            'summary': {}
+            'summary': {},
+            'warnings': []
         }
         
         try:
-            # Load structures (modify this method too if initial/final structures are in different dirs)
+            # Load structures
             structures = self._load_neb_structures(neb_dir, n_images, file_manager, 
-                                                initial_relax_dir, final_relax_dir)
+                                                 initial_relax_dir, final_relax_dir)
             if not structures:
                 logger.error("Failed to load NEB structures")
+                results['error'] = "Failed to load structures"
                 return results
             
-            # Load energies with custom initial/final directories
-            energies = self._load_energies(neb_dir, n_images, initial_relax_dir, final_relax_dir)
-            if not energies:
-                logger.warning("Could not load energies - analysis will be limited")
+            # Validate moving atom index
+            if moving_atom_idx >= len(structures[0]):
+                logger.error(f"Moving atom index {moving_atom_idx} is out of range")
+                results['error'] = f"Invalid atom index {moving_atom_idx}"
+                return results
             
-            # Rest of the method remains the same...
+            # Check if the moving atom is actually oxygen
+            moving_atom_species = str(structures[0][moving_atom_idx].specie)
+            if moving_atom_species != 'O':
+                logger.warning(f"Moving atom {moving_atom_idx} is {moving_atom_species}, not oxygen!")
+                results['warnings'].append(f"Atom {moving_atom_idx} is {moving_atom_species}, not O")
+            
+            # Load energies
+            energies = self._load_energies(neb_dir, n_images, initial_relax_dir, final_relax_dir)
+            has_energies = bool(energies and all(e is not None for e in energies))
+            
+            if not has_energies:
+                logger.warning("Could not load complete energies - analysis will be limited")
+                results['warnings'].append("Energy data incomplete or missing")
+            
             # Environment analysis
             logger.info("Analyzing coordination environments...")
             environment_data = self.analyzer.track_environment_changes(structures, moving_atom_idx)
             results['analysis_data']['environment'] = environment_data
             
-            # ... (rest of the existing code remains unchanged)
+            # Only do energy-dependent analysis if we have energies
+            if has_energies:
+                # Correlations
+                logger.info("Analyzing structure-energy correlations...")
+                correlations = self.analyzer.correlate_with_energy(environment_data, energies)
+                results['analysis_data']['correlations'] = correlations
+                
+                # Landscape features
+                logger.info("Analyzing energy landscape features...")
+                landscape_features = self.analyzer.analyze_energy_landscape_features(
+                    environment_data, energies)
+                results['analysis_data']['landscape'] = landscape_features
+            else:
+                results['analysis_data']['correlations'] = None
+                results['analysis_data']['landscape'] = None
+            
+            # Create visualizations (adapt based on whether we have energies)
+            logger.info("Creating visualizations...")
+            viz_results = {}
+            
+            # These visualizations work without energies
+            viz_results['coordination_evolution'] = self.visualizer.plot_coordination_evolution(
+                environment_data, energies if has_energies else None, 
+                os.path.join(output_dir, "coordination_evolution.png"))
+            
+            viz_results['bond_distribution'] = self.visualizer.plot_bond_distribution(
+                environment_data, os.path.join(output_dir, "bond_distribution.png"))
+            
+            # Only create energy-dependent visualizations if we have energies
+            if has_energies:
+                viz_results['correlation_analysis'] = self.visualizer.plot_correlation_analysis(
+                    correlations, os.path.join(output_dir, "correlation_analysis.png"))
+                
+                viz_results['landscape'] = self.visualizer.plot_energy_structure_landscape(
+                    environment_data, energies, landscape_features,
+                    os.path.join(output_dir, "energy_structure_landscape.png"))
+            
+            # Create some environment snapshots
+            for i in [0, n_images//2, n_images+1]:
+                if i < len(structures):
+                    viz_results[f'snapshot_{i}'] = self.visualizer.plot_environment_snapshot(
+                        structures[i], moving_atom_idx, environment_data[i]['coordination'],
+                        i, output_path=os.path.join(output_dir, f"environment_snapshot_{i}.png"))
+            
+            results['visualizations'] = viz_results
+            
+            # Generate report
+            report_path = self.analyzer.save_analysis_report(
+                environment_data, energies if has_energies else [],
+                correlations if has_energies else {},
+                landscape_features if has_energies else {},
+                os.path.join(output_dir, "analysis_report.txt"))
+            results['reports']['main'] = report_path
+            
+            # Generate summary
+            results['summary'] = self._generate_summary(
+                environment_data, energies if has_energies else None, 
+                landscape_features if has_energies else None)
+            
+            logger.info("Analysis completed successfully")
             
         except Exception as e:
             logger.error(f"Error in oxygen migration analysis: {e}")
+            import traceback
             results['error'] = str(e)
+            results['traceback'] = traceback.format_exc()
         
         return results
     def _load_neb_structures(self, neb_dir: str, n_images: int, file_manager=None,
