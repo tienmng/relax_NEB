@@ -17,7 +17,6 @@ from matplotlib.colors import Normalize
 import seaborn as sns
 from pymatgen.core import Structure
 from pymatgen.analysis.local_env import CrystalNN, VoronoiNN, MinimumDistanceNN
-from pymatgen.analysis.structure_analyzer import OrderParameters
 from typing import List, Dict, Optional, Tuple, Any
 import logging
 from collections import defaultdict
