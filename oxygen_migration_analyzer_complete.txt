@@ -53,7 +53,7 @@ class OxygenEnvironmentAnalyzer:
         Returns:
             Dictionary with improved transition analysis
         """
-        from .improved_transition_state_detection import TransitionStateAnalyzer, improved_transition_state_analysis
+        from improved_transition_state_detection import TransitionStateAnalyzer, improved_transition_state_analysis
         
         # Use improved transition state analysis
         topology = improved_transition_state_analysis(energies, environment_data)
