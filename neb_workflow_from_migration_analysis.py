@@ -930,7 +930,7 @@ if neb_option == 'multi':
     )
     
     # Setup multi-stage NEB (3 stages by default)
-    n_stages = 3 #int(input("Number of NEB stages (2-5) [3]: ") or "3")
+    n_stages = 4 #int(input("Number of NEB stages (2-5) [3]: ") or "3")
         
     # Pass the relaxation energies to the MultiStageNEB setup
     ms_neb.setup_multistage_neb(
