@@ -1,66 +1,313 @@
 #!/usr/bin/env python
 """
-Example integration with your existing NEB workflow
+Fixed workflow integration with better error handling and import management
 """
 
-# Your existing imports
 import sys
 import os
+import logging
+from typing import Dict, Optional
+
+# Set up logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 print("Initializing components...")
+
+# Fix module imports
 module_dir = os.path.abspath(os.path.join(os.getcwd(), '/nfs/home/6/nguyenm/pymatgen-packages/relax_NEB'))
 if module_dir not in sys.path:
     sys.path.insert(0, module_dir)
     print(f"Added {module_dir} to Python path")
-from file_manager import FileManager
-from vasp_inputs import VASPInputGenerator
-from structure_analyzer import StructureAnalyzer
-from slurm_manager import SLURMManager
-from multistage_relaxation import MultiStageStructureRelaxer
-from neb_path_generation_with_constraint_control import NEBPathGenerator
-from energy_analyzer import NEBEnergyAnalyzer
-from neb_multistage import MultiStageNEB
-from file_manager import FileManager
-from energy_analyzer import NEBEnergyAnalyzer
 
-# Add the oxygen migration analyzer
-from oxygen_migration_analyzer_complete import analyze_oxygen_migration, quick_oxygen_analysis
+# Add current directory for oxygen analyzer modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
-# Your existing configuration
-potcar_path = "/nfs/home/6/nguyenm/sensor/POTCAR-files/potpaw_PBE_54"
-potcar_mapping = {
-    "O": "O_s", "La": "La", "Ni": "Ni_pv", "V": "V_sv",
-    "Fe": "Fe_pv", "Co": "Co_pv", "Mn": "Mn_pv"
-}
+# Import with error handling
+try:
+    from file_manager import FileManager
+    from vasp_inputs import VASPInputGenerator
+    from structure_analyzer import StructureAnalyzer
+    from slurm_manager import SLURMManager
+    from multistage_relaxation import MultiStageStructureRelaxer
+    from neb_path_generation_with_constraint_control import NEBPathGenerator
+    from energy_analyzer import NEBEnergyAnalyzer
+    from neb_multistage import MultiStageNEB
+except ImportError as e:
+    logger.error(f"Failed to import NEB modules: {e}")
+    sys.exit(1)
 
-# Parameters
-neb_dir = "./multistage_neb/neb_stage3"
-n_images = 5
-moving_o_idx = 51
+# Import oxygen analyzer with proper error handling
+try:
+    # Try relative import first
+    from oxygen_migration_analyzer_complete import (
+        OxygenMigrationWorkflow, 
+        analyze_oxygen_migration, 
+        quick_oxygen_analysis
+    )
+    from improved_transition_state_detection import TransitionStateAnalyzer
+except ImportError:
+    try:
+        # Try absolute import
+        import oxygen_migration_analyzer_complete
+        from oxygen_migration_analyzer_complete import (
+            OxygenMigrationWorkflow,
+            analyze_oxygen_migration, 
+            quick_oxygen_analysis
+        )
+        import improved_transition_state_detection
+        from improved_transition_state_detection import TransitionStateAnalyzer
+    except ImportError as e:
+        logger.error(f"Failed to import oxygen analyzer modules: {e}")
+        logger.error("Make sure oxygen_migration_analyzer_complete.py and improved_transition_state_detection.py are in the same directory")
+        sys.exit(1)
 
-# Initialize file manager
-file_manager = FileManager(potcar_path, potcar_mapping)
-
-print("Running oxygen migration environment analysis...")
-
-# Run complete analysis
-results = analyze_oxygen_migration(
-    neb_dir=neb_dir,
-    n_images=n_images,
-    moving_atom_idx=moving_o_idx,
-    output_dir="./oxygen_analysis",
-    file_manager=file_manager
-)
-
-# Check results
-if 'error' in results:
-    print(f"Error in analysis: {results['error']}")
-else:
-    print("Analysis completed successfully!")
-    print(f"Generated {len(results['visualizations'])} visualizations")
-    print(f"Reports saved to: {results['reports']}")
+def validate_inputs(neb_dir: str, n_images: int, moving_o_idx: int) -> bool:
+    """Validate input parameters before running analysis."""
     
-    # Print key findings
-    if results['summary']['key_findings']:
-        print("\nKey Findings:")
-        for finding in results['summary']['key_findings']:
-            print(f"  - {finding}")
+    # Check if NEB directory exists
+    if not os.path.exists(neb_dir):
+        logger.error(f"NEB directory does not exist: {neb_dir}")
+        return False
+    
+    # Check if we have the expected image directories
+    missing_dirs = []
+    for i in range(n_images + 2):
+        img_dir = os.path.join(neb_dir, f"{i:02d}")
+        if not os.path.exists(img_dir):
+            missing_dirs.append(img_dir)
+    
+    if missing_dirs:
+        logger.warning(f"Missing {len(missing_dirs)} image directories")
+        if len(missing_dirs) > n_images // 2:
+            logger.error("Too many missing directories to continue")
+            return False
+    
+    # Check for at least one structure file in the first image
+    first_img_dir = os.path.join(neb_dir, "00")
+    has_structure = False
+    for fname in ["CONTCAR", "POSCAR"]:
+        if os.path.exists(os.path.join(first_img_dir, fname)):
+            has_structure = True
+            break
+    
+    if not has_structure:
+        logger.error("No structure files found in initial image directory")
+        return False
+    
+    # Validate atom index by checking first structure
+    try:
+        from pymatgen.core import Structure
+        for fname in ["CONTCAR", "POSCAR"]:
+            fpath = os.path.join(first_img_dir, fname)
+            if os.path.exists(fpath):
+                struct = Structure.from_file(fpath)
+                if moving_o_idx >= len(struct):
+                    logger.error(f"Atom index {moving_o_idx} out of range (structure has {len(struct)} atoms)")
+                    return False
+                # Check if it's actually oxygen
+                species = str(struct[moving_o_idx].specie)
+                if species != 'O':
+                    logger.warning(f"Atom {moving_o_idx} is {species}, not oxygen!")
+                break
+    except Exception as e:
+        logger.warning(f"Could not validate atom index: {e}")
+    
+    return True
+
+def run_oxygen_analysis_with_fallbacks(neb_dir: str, n_images: int, 
+                                      moving_o_idx: int, 
+                                      potcar_path: str,
+                                      potcar_mapping: Dict,
+                                      initial_relax_dir: Optional[str] = None,
+                                      final_relax_dir: Optional[str] = None) -> Dict:
+    """
+    Run oxygen analysis with multiple fallback options.
+    """
+    # Validate inputs first
+    if not validate_inputs(neb_dir, n_images, moving_o_idx):
+        return {'error': 'Input validation failed'}
+    
+    # Initialize file manager
+    try:
+        file_manager = FileManager(potcar_path, potcar_mapping)
+    except Exception as e:
+        logger.warning(f"Could not initialize FileManager: {e}")
+        file_manager = None
+    
+    # Set up output directory
+    output_dir = os.path.join(os.path.dirname(neb_dir), "oxygen_analysis")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"Running oxygen migration environment analysis...")
+    print(f"NEB directory: {neb_dir}")
+    print(f"Number of images: {n_images}")
+    print(f"Moving oxygen index: {moving_o_idx}")
+    print(f"Output directory: {output_dir}")
+    
+    # Try complete analysis first
+    try:
+        results = analyze_oxygen_migration(
+            neb_dir=neb_dir,
+            n_images=n_images,
+            moving_atom_idx=moving_o_idx,
+            output_dir=output_dir,
+            file_manager=file_manager,
+            initial_relax_dir=initial_relax_dir,
+            final_relax_dir=final_relax_dir
+        )
+        
+        if 'error' not in results:
+            return results
+        else:
+            logger.warning(f"Complete analysis failed: {results['error']}")
+            
+    except Exception as e:
+        logger.error(f"Complete analysis failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Try quick analysis as fallback
+    print("\nFalling back to quick analysis...")
+    try:
+        quick_results = quick_oxygen_analysis(
+            neb_dir=neb_dir,
+            n_images=n_images,
+            moving_atom_idx=moving_o_idx,
+            initial_relax_dir=initial_relax_dir,
+            final_relax_dir=final_relax_dir
+        )
+        
+        # Add indication that this was a fallback
+        quick_results['analysis_type'] = 'quick_fallback'
+        quick_results['output_dir'] = output_dir
+        
+        # Save quick results
+        import json
+        with open(os.path.join(output_dir, 'quick_analysis_results.json'), 'w') as f:
+            json.dump(quick_results, f, indent=2)
+        
+        print(f"Quick analysis results saved to {output_dir}/quick_analysis_results.json")
+        return quick_results
+        
+    except Exception as e:
+        logger.error(f"Quick analysis also failed: {e}")
+        return {
+            'error': 'Both complete and quick analysis failed',
+            'complete_error': str(e),
+            'suggestions': [
+                'Check that all image directories exist',
+                'Verify the moving atom index is correct',
+                'Ensure CONTCAR/POSCAR files are valid',
+                'Check that pymatgen can read your structure files'
+            ]
+        }
+
+def print_analysis_summary(results: Dict):
+    """Print a nice summary of the analysis results."""
+    print("\n" + "="*60)
+    print("OXYGEN MIGRATION ANALYSIS SUMMARY")
+    print("="*60)
+    
+    if 'error' in results:
+        print(f"\n❌ Analysis failed: {results['error']}")
+        if 'suggestions' in results:
+            print("\nSuggestions:")
+            for s in results['suggestions']:
+                print(f"  • {s}")
+        return
+    
+    # Check if it was a quick analysis
+    if results.get('analysis_type') == 'quick_fallback':
+        print("\n⚠️  Quick analysis performed (full analysis failed)")
+        print("\nResults:")
+        if 'comparison' in results:
+            comp = results['comparison']
+            print(f"  • Coordination number change: {comp.get('cn_change', 'N/A')}")
+            print(f"  • Bond length change: {comp.get('bond_length_change', 'N/A'):.3f} Å")
+            print(f"  • Geometry change: {comp.get('geometry_change', 'N/A')}")
+        return
+    
+    # Full analysis results
+    print("\n✓ Complete analysis successful!")
+    
+    # Visualizations
+    if 'visualizations' in results:
+        print(f"\nGenerated {len(results['visualizations'])} visualizations:")
+        for viz_name, viz_path in results['visualizations'].items():
+            if viz_path and os.path.exists(viz_path):
+                print(f"  • {viz_name}: {os.path.basename(viz_path)}")
+    
+    # Reports
+    if 'reports' in results:
+        print(f"\nGenerated reports:")
+        for report_name, report_path in results['reports'].items():
+            if report_path and os.path.exists(report_path):
+                print(f"  • {report_name}: {os.path.basename(report_path)}")
+    
+    # Key findings
+    if 'summary' in results and 'key_findings' in results['summary']:
+        findings = results['summary']['key_findings']
+        if findings:
+            print(f"\nKey findings:")
+            for finding in findings:
+                print(f"  • {finding}")
+    
+    # Warnings
+    if 'warnings' in results and results['warnings']:
+        print(f"\n⚠️  Warnings:")
+        for warning in results['warnings']:
+            print(f"  • {warning}")
+    
+    print("\n" + "="*60)
+
+# Main execution
+if __name__ == "__main__":
+    # Configuration
+    potcar_path = "/nfs/home/6/nguyenm/sensor/POTCAR-files/potpaw_PBE_54"
+    potcar_mapping = {
+        "O": "O_s", "La": "La", "Ni": "Ni_pv", "V": "V_sv",
+        "Fe": "Fe_pv", "Co": "Co_pv", "Mn": "Mn_pv"
+    }
+    
+    # Parameters - make these command line arguments in production
+    neb_dir = "./multistage_neb/neb_stage3"
+    n_images = 5
+    moving_o_idx = 51
+    
+    # Optional: specify custom initial/final relaxation directories
+    initial_relax_dir = "./relax_initial/stage1"
+    final_relax_dir = "./relax_final/stage1"
+    
+    # Run analysis with error handling
+    results = run_oxygen_analysis_with_fallbacks(
+        neb_dir=neb_dir,
+        n_images=n_images,
+        moving_o_idx=moving_o_idx,
+        potcar_path=potcar_path,
+        potcar_mapping=potcar_mapping,
+        initial_relax_dir=initial_relax_dir,
+        final_relax_dir=final_relax_dir
+    )
+    
+    # Print summary
+    print_analysis_summary(results)
+    
+    # Save full results
+    if 'output_dir' in results:
+        import json
+        full_results_path = os.path.join(results['output_dir'], 'full_results.json')
+        # Convert non-serializable objects
+        clean_results = {}
+        for k, v in results.items():
+            if k not in ['analysis_data']:  # Skip large data structures
+                clean_results[k] = v
+        
+        with open(full_results_path, 'w') as f:
+            json.dump(clean_results, f, indent=2)
+        print(f"\nFull results saved to: {full_results_path}")
