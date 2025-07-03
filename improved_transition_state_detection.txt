@@ -1,0 +1,455 @@
+#!/usr/bin/env python
+"""
+Improved transition state identification for NEB calculations.
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TransitionStateAnalyzer:
+    """
+    Advanced transition state identification and analysis.
+    """
+    
+    def __init__(self, energy_tolerance: float = 0.001):
+        """
+        Initialize with energy tolerance for identifying stationary points.
+        
+        Args:
+            energy_tolerance: Minimum energy difference to consider significant (eV)
+        """
+        self.energy_tolerance = energy_tolerance
+    
+    def identify_transition_states(self, energies: List[float], 
+                                 exclude_endpoints: bool = True) -> Dict:
+        """
+        Identify all transition states (local maxima) in the energy profile.
+        
+        Args:
+            energies: List of energies along the path
+            exclude_endpoints: Whether to exclude first and last images
+            
+        Returns:
+            Dictionary with transition state information
+        """
+        if len(energies) < 3:
+            logger.warning("Need at least 3 images to identify transition states")
+            return {'transition_states': [], 'primary_ts': None}
+        
+        rel_energies = [e - energies[0] for e in energies]
+        transition_states = []
+        
+        # Define search range
+        start_idx = 1 if exclude_endpoints else 0
+        end_idx = len(energies) - 1 if exclude_endpoints else len(energies)
+        
+        # Find local maxima
+        for i in range(start_idx, end_idx):
+            is_local_max = True
+            current_energy = rel_energies[i]
+            
+            # Check if this point is higher than all neighbors
+            # (more robust than just checking immediate neighbors)
+            
+            # Check previous points
+            if i > 0:
+                for j in range(max(0, i-2), i):  # Check up to 2 points back
+                    if rel_energies[j] >= current_energy + self.energy_tolerance:
+                        is_local_max = False
+                        break
+            
+            # Check subsequent points
+            if is_local_max and i < len(rel_energies) - 1:
+                for j in range(i+1, min(len(rel_energies), i+3)):  # Check up to 2 points forward
+                    if rel_energies[j] >= current_energy + self.energy_tolerance:
+                        is_local_max = False
+                        break
+            
+            # Additional check: ensure it's actually higher than immediate neighbors
+            if is_local_max:
+                if i > 0 and rel_energies[i-1] >= current_energy - self.energy_tolerance:
+                    is_local_max = False
+                if i < len(rel_energies) - 1 and rel_energies[i+1] >= current_energy - self.energy_tolerance:
+                    is_local_max = False
+            
+            if is_local_max:
+                transition_states.append({
+                    'image': i,
+                    'energy': current_energy,
+                    'absolute_energy': energies[i],
+                    'barrier_height': current_energy,  # Relative to initial state
+                    'type': 'local_maximum'
+                })
+        
+        # Identify primary transition state (highest energy local maximum)
+        primary_ts = None
+        if transition_states:
+            primary_ts = max(transition_states, key=lambda x: x['energy'])
+            primary_ts['type'] = 'primary_transition_state'
+        
+        # If no local maxima found, fall back to global maximum
+        if not transition_states and not exclude_endpoints:
+            global_max_idx = np.argmax(rel_energies)
+            primary_ts = {
+                'image': global_max_idx,
+                'energy': rel_energies[global_max_idx],
+                'absolute_energy': energies[global_max_idx],
+                'barrier_height': rel_energies[global_max_idx],
+                'type': 'global_maximum'
+            }
+            transition_states.append(primary_ts)
+        
+        return {
+            'transition_states': transition_states,
+            'primary_ts': primary_ts,
+            'method': 'local_maxima_detection'
+        }
+    
+    def identify_minima(self, energies: List[float], 
+                       exclude_endpoints: bool = True) -> List[Dict]:
+        """
+        Identify local minima (stable/metastable states) in the energy profile.
+        
+        Args:
+            energies: List of energies along the path
+            exclude_endpoints: Whether to exclude first and last images
+            
+        Returns:
+            List of local minima information
+        """
+        if len(energies) < 3:
+            return []
+        
+        rel_energies = [e - energies[0] for e in energies]
+        minima = []
+        
+        start_idx = 1 if exclude_endpoints else 0
+        end_idx = len(energies) - 1 if exclude_endpoints else len(energies)
+        
+        for i in range(start_idx, end_idx):
+            is_local_min = True
+            current_energy = rel_energies[i]
+            
+            # Check if lower than neighbors
+            if i > 0 and rel_energies[i-1] <= current_energy + self.energy_tolerance:
+                is_local_min = False
+            if i < len(rel_energies) - 1 and rel_energies[i+1] <= current_energy + self.energy_tolerance:
+                is_local_min = False
+            
+            if is_local_min:
+                minima.append({
+                    'image': i,
+                    'energy': current_energy,
+                    'absolute_energy': energies[i],
+                    'type': 'local_minimum'
+                })
+        
+        return minima
+    
+    def analyze_energy_profile_topology(self, energies: List[float]) -> Dict:
+        """
+        Complete topological analysis of the energy profile.
+        
+        Args:
+            energies: List of energies along the path
+            
+        Returns:
+            Dictionary with complete topology analysis
+        """
+        rel_energies = [e - energies[0] for e in energies]
+        
+        # Find transition states and minima
+        ts_info = self.identify_transition_states(energies, exclude_endpoints=True)
+        minima = self.identify_minima(energies, exclude_endpoints=True)
+        
+        # Always include endpoints as special points
+        initial_state = {
+            'image': 0,
+            'energy': rel_energies[0],
+            'absolute_energy': energies[0],
+            'type': 'initial_state'
+        }
+        
+        final_state = {
+            'image': len(energies) - 1,
+            'energy': rel_energies[-1],
+            'absolute_energy': energies[-1],
+            'type': 'final_state'
+        }
+        
+        # Calculate key energetic quantities
+        analysis = {
+            'initial_state': initial_state,
+            'final_state': final_state,
+            'transition_states': ts_info['transition_states'],
+            'primary_transition_state': ts_info['primary_ts'],
+            'local_minima': minima,
+            'energetics': {}
+        }
+        
+        # Calculate activation energies and reaction energy
+        if ts_info['primary_ts']:
+            primary_ts = ts_info['primary_ts']
+            analysis['energetics'] = {
+                'activation_energy_forward': primary_ts['energy'] - rel_energies[0],
+                'activation_energy_reverse': primary_ts['energy'] - rel_energies[-1],
+                'reaction_energy': rel_energies[-1] - rel_energies[0],
+                'barrier_asymmetry': self._calculate_barrier_asymmetry(
+                    rel_energies[0], primary_ts['energy'], rel_energies[-1]
+                ),
+                'is_elementary': len(ts_info['transition_states']) == 1,
+                'is_endothermic': rel_energies[-1] > rel_energies[0]
+            }
+        
+        # Classify reaction type
+        analysis['reaction_classification'] = self._classify_reaction_type(analysis)
+        
+        return analysis
+    
+    def _calculate_barrier_asymmetry(self, initial_e: float, ts_e: float, final_e: float) -> float:
+        """
+        Calculate barrier asymmetry factor.
+        
+        Returns:
+            Asymmetry factor: 1.0 = symmetric, >1.0 = forward barrier higher, <1.0 = reverse barrier higher
+        """
+        forward_barrier = ts_e - initial_e
+        reverse_barrier = ts_e - final_e
+        
+        if reverse_barrier <= 0:
+            return float('inf')
+        
+        return forward_barrier / reverse_barrier
+    
+    def _classify_reaction_type(self, analysis: Dict) -> Dict:
+        """
+        Classify the type of reaction based on energy profile.
+        """
+        classification = {
+            'mechanism': 'unknown',
+            'description': '',
+            'complexity': 'simple'
+        }
+        
+        n_ts = len(analysis['transition_states'])
+        n_minima = len(analysis['local_minima'])
+        
+        if n_ts == 0:
+            classification['mechanism'] = 'barrierless'
+            classification['description'] = 'No significant energy barrier detected'
+        elif n_ts == 1 and n_minima == 0:
+            classification['mechanism'] = 'elementary'
+            classification['description'] = 'Single-step reaction with one transition state'
+        elif n_ts == 1 and n_minima > 0:
+            classification['mechanism'] = 'elementary_with_intermediates'
+            classification['description'] = 'Single barrier with intermediate states'
+            classification['complexity'] = 'moderate'
+        elif n_ts > 1:
+            classification['mechanism'] = 'multi_step'
+            classification['description'] = f'Multi-step reaction with {n_ts} transition states'
+            classification['complexity'] = 'complex'
+        
+        return classification
+    
+    def validate_transition_state(self, energies: List[float], ts_image: int,
+                                environment_data: List[Dict] = None) -> Dict:
+        """
+        Validate that a proposed transition state is reasonable.
+        
+        Args:
+            energies: Energy profile
+            ts_image: Proposed transition state image index
+            environment_data: Optional structural information
+            
+        Returns:
+            Validation results
+        """
+        validation = {
+            'is_valid': False,
+            'issues': [],
+            'confidence': 0.0,
+            'structural_validation': {}
+        }
+        
+        if ts_image < 1 or ts_image >= len(energies) - 1:
+            validation['issues'].append("Transition state at endpoint")
+            return validation
+        
+        rel_energies = [e - energies[0] for e in energies]
+        ts_energy = rel_energies[ts_image]
+        
+        # Energy validation
+        energy_issues = []
+        
+        # Check if it's a local maximum
+        if (rel_energies[ts_image - 1] >= ts_energy or 
+            rel_energies[ts_image + 1] >= ts_energy):
+            energy_issues.append("Not a local energy maximum")
+        
+        # Check barrier height is reasonable
+        if ts_energy < 0.01:  # 10 meV
+            energy_issues.append("Barrier too low (< 0.01 eV)")
+        elif ts_energy > 5.0:  # 5 eV
+            energy_issues.append("Barrier very high (> 5.0 eV)")
+        
+        validation['issues'].extend(energy_issues)
+        
+        # Structural validation if environment data available
+        if environment_data and ts_image < len(environment_data):
+            ts_env = environment_data[ts_image]
+            initial_env = environment_data[0]
+            final_env = environment_data[-1]
+            
+            # Check for coordination changes
+            ts_cn = ts_env['geometry']['coordination_number']
+            initial_cn = initial_env['geometry']['coordination_number']
+            final_cn = final_env['geometry']['coordination_number']
+            
+            structural_features = {
+                'coordination_change': ts_cn != initial_cn or ts_cn != final_cn,
+                'bond_distortion': ts_env['geometry'].get('bond_distortion_index', 0),
+                'is_intermediate_coordination': (
+                    initial_cn != final_cn and 
+                    (ts_cn == min(initial_cn, final_cn) or ts_cn == max(initial_cn, final_cn))
+                )
+            }
+            
+            validation['structural_validation'] = structural_features
+            
+            # Structural reasonableness checks
+            if structural_features['bond_distortion'] > 0.5:
+                validation['issues'].append("Very high bond distortion at TS")
+            
+            if (initial_cn == final_cn and ts_cn == initial_cn and 
+                structural_features['bond_distortion'] < 0.01):
+                validation['issues'].append("No significant structural change at TS")
+        
+        # Calculate confidence
+        confidence = 1.0
+        for issue in validation['issues']:
+            if "Not a local energy maximum" in issue:
+                confidence -= 0.5
+            elif "too low" in issue or "very high" in issue:
+                confidence -= 0.3
+            else:
+                confidence -= 0.1
+        
+        validation['confidence'] = max(0.0, confidence)
+        validation['is_valid'] = len(validation['issues']) == 0 and confidence > 0.5
+        
+        return validation
+
+
+# Integration with existing oxygen migration analyzer
+def improved_transition_state_analysis(energies: List[float], 
+                                     environment_data: List[Dict] = None) -> Dict:
+    """
+    Improved transition state analysis using the new methods.
+    
+    Args:
+        energies: Energy profile
+        environment_data: Optional environment analysis data
+        
+    Returns:
+        Comprehensive transition state analysis
+    """
+    analyzer = TransitionStateAnalyzer()
+    
+    # Full topological analysis
+    topology = analyzer.analyze_energy_profile_topology(energies)
+    
+    # Validate the primary transition state
+    if topology['primary_transition_state']:
+        ts_image = topology['primary_transition_state']['image']
+        validation = analyzer.validate_transition_state(energies, ts_image, environment_data)
+        topology['primary_transition_state']['validation'] = validation
+    
+    # Validate all transition states
+    for ts in topology['transition_states']:
+        ts_image = ts['image']
+        validation = analyzer.validate_transition_state(energies, ts_image, environment_data)
+        ts['validation'] = validation
+    
+    return topology
+
+
+# Example usage and comparison
+if __name__ == "__main__":
+    # Example energy profile with multiple features
+    import matplotlib.pyplot as plt
+    
+    # Simulate a complex energy profile
+    x = np.linspace(0, 10, 21)
+    energies = (
+        0.5 * np.sin(x) + 
+        0.3 * np.sin(3*x) + 
+        0.1 * np.random.normal(0, 0.05, len(x)) +
+        0.2 * x  # Overall uphill
+    )
+    energies[0] = 0.0  # Set initial energy to zero
+    
+    print("Transition State Analysis Comparison")
+    print("=" * 40)
+    
+    # Old method (simple maximum)
+    old_ts = np.argmax(energies)
+    print(f"Old method (global max): Image {old_ts}, Energy = {energies[old_ts]:.3f} eV")
+    
+    # New method (topological analysis)
+    analyzer = TransitionStateAnalyzer()
+    topology = analyzer.analyze_energy_profile_topology(energies)
+    
+    print(f"\nNew method (topological analysis):")
+    print(f"Number of transition states: {len(topology['transition_states'])}")
+    
+    if topology['primary_transition_state']:
+        pts = topology['primary_transition_state']
+        print(f"Primary TS: Image {pts['image']}, Energy = {pts['energy']:.3f} eV")
+        print(f"Type: {pts['type']}")
+    
+    print(f"Number of local minima: {len(topology['local_minima'])}")
+    print(f"Reaction classification: {topology['reaction_classification']['mechanism']}")
+    print(f"Description: {topology['reaction_classification']['description']}")
+    
+    if topology['energetics']:
+        energetics = topology['energetics']
+        print(f"\nEnergetics:")
+        print(f"Activation energy (forward): {energetics['activation_energy_forward']:.3f} eV")
+        print(f"Activation energy (reverse): {energetics['activation_energy_reverse']:.3f} eV")
+        print(f"Reaction energy: {energetics['reaction_energy']:.3f} eV")
+        print(f"Barrier asymmetry: {energetics['barrier_asymmetry']:.2f}")
+    
+    # Plot comparison
+    plt.figure(figsize=(12, 6))
+    plt.plot(range(len(energies)), energies, 'b-o', label='Energy profile')
+    
+    # Mark old method result
+    plt.plot(old_ts, energies[old_ts], 'rs', markersize=10, label='Old method (global max)')
+    
+    # Mark new method results
+    for ts in topology['transition_states']:
+        plt.plot(ts['image'], ts['absolute_energy'], 'go', markersize=8, 
+                label='New method (local max)' if ts == topology['transition_states'][0] else "")
+    
+    if topology['primary_transition_state']:
+        pts = topology['primary_transition_state']
+        plt.plot(pts['image'], pts['absolute_energy'], 'r*', markersize=15, 
+                label='Primary TS')
+    
+    for minimum in topology['local_minima']:
+        plt.plot(minimum['image'], minimum['absolute_energy'], 'co', markersize=6,
+                label='Local minima' if minimum == topology['local_minima'][0] else "")
+    
+    plt.xlabel('Image')
+    plt.ylabel('Energy (eV)')
+    plt.title('Transition State Identification Comparison')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('ts_comparison.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"\nComparison plot saved as 'ts_comparison.png'")
