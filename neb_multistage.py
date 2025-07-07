@@ -123,7 +123,7 @@ class MultiStageNEB:
                     'ICHAIN': 0,
                     'SPRING': -5,     # Negative spring for climbing image
                     'IBRION': 1,      # Use RMM-DIIS quasi-Newton
-                    'POTIM': 0.1,     # Slightly larger step size
+                    'POTIM': 0.2,     # Slightly larger step size
                     'IOPT': 0,
                     'EDIFFG': -0.05,  # Intermediate force convergence
                     'NSW': 100,       # More steps for climbing image
@@ -161,7 +161,7 @@ class MultiStageNEB:
                     'ICHAIN': 0,
                     'SPRING': -5,     # Negative spring for climbing image
                     'IBRION': 1,      # Use DIIS quasi-Newton
-                    'POTIM': 0.05,    # Small step size for final convergence
+                    'POTIM': 0.2,    # Small step size for final convergence
                     'IOPT': 0,
                     'EDIFFG': -0.01,  # Tight force convergence
                     'NSW': 100,       # Maximum ionic steps
@@ -169,7 +169,7 @@ class MultiStageNEB:
                     
                     # Electronic structure settings
                     'EDIFF': 1E-6,
-                    'NELM': 100,
+                    'NELM': 200,
                     'ALGO': 'Fast',   # Fast algorithm for final stage
                     'PREC': 'Accurate',
                     'LSCALAPACK': True,
@@ -199,7 +199,7 @@ class MultiStageNEB:
                     'ICHAIN': 0,
                     'SPRING': -5,     # Negative spring for climbing image
                     'IBRION': 1,      # Use DIIS quasi-Newton
-                    'POTIM': 0.02,    # Small step size for final convergence
+                    'POTIM': 0.1,    # Small step size for final convergence
                     'IOPT': 0,
                     'EDIFFG': -0.01,  # Tight force convergence
                     'NSW': 100,       # Maximum ionic steps
@@ -208,7 +208,7 @@ class MultiStageNEB:
                     # Electronic structure settings
                     'EDIFF': 1E-6,
                     'NELM': 200,
-                    'ALGO': 'Normal',   # Fast algorithm for final stage
+                    'ALGO': 'Fast',   # Fast algorithm for final stage
                     'PREC': 'Accurate',
                     'LSCALAPACK': True,
                     'LSCALU' : False,
