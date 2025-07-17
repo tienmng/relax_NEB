@@ -197,7 +197,6 @@ class OxygenEnvironmentAnalyzer:
         """
         # Force distance-based method regardless of input
         return self._distance_based_coordination_pbc(structure, atom_idx)
-
     def _distance_based_coordination_pbc(self, structure: Structure, 
                                        atom_idx: int) -> Dict:
         """
@@ -216,27 +215,35 @@ class OxygenEnvironmentAnalyzer:
         # Get all neighbors within cutoff using PBC
         neighbors = structure.get_neighbors(structure[atom_idx], self.cutoff_radius)
         
-        for neighbor_site, distance, index in neighbors:
+        # Fixed: get_neighbors returns (site, distance, index, image)
+        for neighbor_data in neighbors:
+            if len(neighbor_data) == 4:
+                neighbor_site, distance, index, image = neighbor_data
+            else:
+                # Fallback for older pymatgen versions
+                neighbor_site, distance, index = neighbor_data
+                image = [0, 0, 0]
+                
             element = str(neighbor_site.specie)
             
             coord_info['neighbors'].append({
                 'index': index,
                 'element': element,
                 'distance': distance,
-                'image': [0, 0, 0]  # Not tracking image for simplicity
+                'image': list(image)  # Convert to list if it's a numpy array
             })
             
             coord_info['bond_lengths'].append(distance)
             coord_info['neighbor_types'][element] += 1
         
         coord_info['coordination_number'] = len(coord_info['neighbors'])
-        
-        if coord_info['bond_lengths']:
-            coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
-            coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
-            coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
-        
-        return coord_info
+    
+    if coord_info['bond_lengths']:
+        coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
+        coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
+        coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
+    
+    return coord_info
 
     def _simple_coordination_analysis(self, structure: Structure, 
                                     atom_idx: int) -> Dict:
