@@ -157,81 +157,94 @@ class OxygenEnvironmentAnalyzer:
             'min_bond_length': float('inf'),
             'max_bond_length': 0.0
         }
+    def calculate_element_specific_bonds(self, coord_info: Dict) -> Dict:
+        """
+        Calculate bond length statistics for each element type.
+        
+        Args:
+            coord_info: Coordination information from analyze_coordination
+            
+        Returns:
+            Dictionary with bond statistics per element
+        """
+        element_bonds = defaultdict(list)
+        
+        # Group bonds by element type
+        for neighbor in coord_info['neighbors']:
+            element = neighbor['element']
+            distance = neighbor['distance']
+            element_bonds[element].append(distance)
+        
+        # Calculate statistics for each element
+        element_stats = {}
+        for element, bonds in element_bonds.items():
+            if bonds:
+                element_stats[element] = {
+                    'count': len(bonds),
+                    'min': min(bonds),
+                    'max': max(bonds),
+                    'average': np.mean(bonds),
+                    'std': np.std(bonds),
+                    'bonds': bonds  # Keep individual bonds for later use
+                }
+        
+        return element_stats
 
     def analyze_coordination(self, structure: Structure, atom_idx: int, 
                            method: str = 'crystal') -> Dict:
         """
-        Analyze coordination environment of an atom with better error handling.
+        Analyze coordination environment of an atom using distance-based method with PBC.
         """
-        # Validate inputs
-        if atom_idx < 0 or atom_idx >= len(structure):
-            logger.error(f"Invalid atom index {atom_idx} for structure with {len(structure)} atoms")
-            return self._empty_coordination_info()
+        # Force distance-based method regardless of input
+        return self._distance_based_coordination_pbc(structure, atom_idx)
+    def _distance_based_coordination_pbc(self, structure: Structure, 
+                                       atom_idx: int) -> Dict:
+        """
+        Distance-based coordination analysis with proper PBC handling.
+        """
+        coord_info = {
+            'coordination_number': 0,
+            'neighbors': [],
+            'bond_lengths': [],
+            'neighbor_types': defaultdict(int),
+            'average_bond_length': 0.0,
+            'min_bond_length': float('inf'),
+            'max_bond_length': 0.0
+        }
         
-        if method == 'crystal':
-            nn_finder = self.cnn
-        elif method == 'voronoi':
-            nn_finder = self.vnn
-        else:
-            nn_finder = self.mdnn
-            
-        try:
-            # Get neighbors
-            neighbors = nn_finder.get_nn_info(structure, atom_idx)
-            
-            # Analyze coordination
-            coord_info = {
-                'coordination_number': len(neighbors),
-                'neighbors': [],
-                'bond_lengths': [],
-                'neighbor_types': defaultdict(int),
-                'average_bond_length': 0.0,
-                'min_bond_length': float('inf'),
-                'max_bond_length': 0.0
-            }
-            
-            for neighbor in neighbors:
-                element = str(structure[neighbor['site_index']].specie)
-                distance = neighbor.get('weight', 0.0)  # Weight often stores distance
-                
-                # For some methods, calculate distance manually
-                if distance == 0.0:
-                    site1 = structure[atom_idx].coords
-                    site2 = structure[neighbor['site_index']].coords
-                    distance = np.linalg.norm(site1 - site2)
-                
-                coord_info['neighbors'].append({
-                    'index': neighbor['site_index'],
-                    'element': element,
-                    'distance': distance,
-                    'image': neighbor.get('image', [0, 0, 0])
-                })
-                
-                coord_info['bond_lengths'].append(distance)
-                coord_info['neighbor_types'][element] += 1
-                
-            # Calculate statistics
-            if coord_info['bond_lengths']:
-                coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
-                coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
-                coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
-                
-        except Exception as e:  
-            logger.warning(f"Error analyzing coordination with {method}: {e}")
-            # Try alternative methods before falling back
-            if method == 'crystal':
-                logger.info("Trying Voronoi method...")
-                return self.analyze_coordination(structure, atom_idx, 'voronoi')
-            elif method == 'voronoi':
-                logger.info("Trying distance method...")
-                return self.analyze_coordination(structure, atom_idx, 'distance')
+        # Get all neighbors within cutoff using PBC
+        neighbors = structure.get_neighbors(structure[atom_idx], self.cutoff_radius)
+        
+        # Fixed: get_neighbors returns (site, distance, index, image)
+        for neighbor_data in neighbors:
+            if len(neighbor_data) == 4:
+                neighbor_site, distance, index, image = neighbor_data
             else:
-                # Final fallback
-                return self._simple_coordination_analysis(structure, atom_idx)
-
+                # Fallback for older pymatgen versions
+                neighbor_site, distance, index = neighbor_data
+                image = [0, 0, 0]
+                
+            element = str(neighbor_site.specie)
             
-        return coord_info
+            coord_info['neighbors'].append({
+                'index': index,
+                'element': element,
+                'distance': distance,
+                'image': list(image)  # Convert to list if it's a numpy array
+            })
+            
+            coord_info['bond_lengths'].append(distance)
+            coord_info['neighbor_types'][element] += 1
+        
+        coord_info['coordination_number'] = len(coord_info['neighbors'])
     
+    if coord_info['bond_lengths']:
+        coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
+        coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
+        coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
+    
+    return coord_info
+
     def _simple_coordination_analysis(self, structure: Structure, 
                                     atom_idx: int) -> Dict:
         """
@@ -388,18 +401,10 @@ class OxygenEnvironmentAnalyzer:
             geometry_params['angular_distortion'] = np.mean(angle_deviations)
             
         return geometry_params
-    
     def track_environment_changes(self, structures: List[Structure],
                                 moving_atom_idx: int) -> List[Dict]:
         """
         Track how the environment changes along the NEB path.
-        
-        Args:
-            structures: List of structures along NEB path
-            moving_atom_idx: Index of moving oxygen atom
-            
-        Returns:
-            List of environment analysis for each image
         """
         environment_data = []
         
@@ -408,6 +413,9 @@ class OxygenEnvironmentAnalyzer:
             
             # Analyze coordination
             coord_info = self.analyze_coordination(struct, moving_atom_idx)
+            
+            # NEW: Calculate element-specific bond statistics
+            element_bonds = self.calculate_element_specific_bonds(coord_info)
             
             # Analyze geometry
             geometry = self.calculate_geometry_parameters(struct, moving_atom_idx, coord_info)
@@ -419,6 +427,7 @@ class OxygenEnvironmentAnalyzer:
             env_data = {
                 'image': i,
                 'coordination': coord_info,
+                'element_bonds': element_bonds,  # NEW: Add element-specific bonds
                 'geometry': geometry,
                 'angles': angles
             }
@@ -426,55 +435,90 @@ class OxygenEnvironmentAnalyzer:
             environment_data.append(env_data)
             
         return environment_data
+
     def correlate_with_energy(self, environment_data: List[Dict],
-                                   energies: List[float]) -> Dict:
+                             energies: List[float]) -> Dict:
         """
-        Fixed version with better error handling.
+        Enhanced version with element-specific correlations.
         """
         if not environment_data or not energies:
             logger.error("Missing environment data or energies")
-            return {
-                'coordination_energy': 0.0,
-                'bond_length_energy': 0.0,
-                'distortion_energy': 0.0,
-                'data': {},
-                'transitions': {'coordination_changes': [], 'transition_state': None}
-            }
+            return {}
         
-        if len(environment_data) != len(energies):
-            logger.error(f"Mismatch: {len(environment_data)} env data vs {len(energies)} energies")
-            # Try to work with minimum length
-            min_len = min(len(environment_data), len(energies))
-            environment_data = environment_data[:min_len]
-            energies = energies[:min_len]
-            logger.warning(f"Truncating to {min_len} data points")
-        
-        # Extract key parameters (same as before)
+        # Existing code...
         coord_numbers = [env['geometry']['coordination_number'] for env in environment_data]
         avg_bond_lengths = [env['coordination']['average_bond_length'] for env in environment_data]
         bond_variances = [env['geometry'].get('bond_length_variance', 0) for env in environment_data]
         
+        # NEW: Extract element-specific data
+        all_elements = set()
+        for env in environment_data:
+            if 'element_bonds' in env:
+                all_elements.update(env['element_bonds'].keys())
+        
+        element_correlations = {}
+        element_data = defaultdict(lambda: defaultdict(list))
+        
+        for element in all_elements:
+            for env in environment_data:
+                if 'element_bonds' in env and element in env['element_bonds']:
+                    stats = env['element_bonds'][element]
+                    element_data[element]['coordination'].append(stats['count'])
+                    element_data[element]['avg_bond'].append(stats['average'])
+                    element_data[element]['min_bond'].append(stats['min'])
+                    element_data[element]['max_bond'].append(stats['max'])
+                else:
+                    # Pad with None or 0 for missing data
+                    element_data[element]['coordination'].append(0)
+                    element_data[element]['avg_bond'].append(None)
+                    element_data[element]['min_bond'].append(None)
+                    element_data[element]['max_bond'].append(None)
+        
         # Calculate relative energies
         rel_energies = [e - energies[0] for e in energies]
         
-        # Find correlations (same as before)
+        # Calculate correlations
         correlations = {
             'coordination_energy': self._calculate_correlation(coord_numbers, rel_energies),
             'bond_length_energy': self._calculate_correlation(avg_bond_lengths, rel_energies),
             'distortion_energy': self._calculate_correlation(bond_variances, rel_energies),
+            'element_specific': {},  # NEW
             'data': {
                 'coordination_numbers': coord_numbers,
                 'average_bond_lengths': avg_bond_lengths,
                 'bond_variances': bond_variances,
-                'relative_energies': rel_energies
+                'relative_energies': rel_energies,
+                'element_data': dict(element_data)  # NEW
             }
         }
+        
+        # Calculate element-specific correlations
+        for element in all_elements:
+            element_corr = {}
+            
+            # Only calculate if we have valid data
+            valid_coords = [x for x in element_data[element]['coordination'] if x > 0]
+            valid_avg_bonds = [x for x in element_data[element]['avg_bond'] if x is not None]
+            
+            if len(valid_coords) >= 2:
+                # For coordination, use all data points
+                element_corr['coordination'] = self._calculate_correlation(
+                    element_data[element]['coordination'], rel_energies)
+            
+            if len(valid_avg_bonds) >= 2:
+                # For bonds, only use images where this element is present
+                valid_indices = [i for i, x in enumerate(element_data[element]['avg_bond']) if x is not None]
+                valid_energies = [rel_energies[i] for i in valid_indices]
+                valid_bonds = [element_data[element]['avg_bond'][i] for i in valid_indices]
+                
+                element_corr['avg_bond'] = self._calculate_correlation(valid_bonds, valid_energies)
+            
+            correlations['element_specific'][element] = element_corr
         
         # Use improved transition identification
         correlations['transitions'] = self._identify_transitions(environment_data, energies)
         
         return correlations
-
     
     def _calculate_correlation(self, x: List[float], y: List[float]) -> float:
         """Calculate Pearson correlation coefficient."""
@@ -632,7 +676,42 @@ class OxygenEnvironmentAnalyzer:
             f.write(f"Coordination vs Energy: {correlations['coordination_energy']:.3f}\n")
             f.write(f"Bond Length vs Energy: {correlations['bond_length_energy']:.3f}\n")
             f.write(f"Distortion vs Energy: {correlations['distortion_energy']:.3f}\n")
+
+            # After the correlation section, add:
+            f.write(f"\nELEMENT-SPECIFIC ANALYSIS\n")
+            f.write("-" * 25 + "\n")
             
+            # Get all elements
+            all_elements = set()
+            for env in environment_data:
+                if 'element_bonds' in env:
+                    all_elements.update(env['element_bonds'].keys())
+            
+            for element in sorted(all_elements):
+                f.write(f"\n{element}-O Bonds:\n")
+                
+                # Initial and final states
+                initial_bonds = environment_data[0].get('element_bonds', {}).get(element, {})
+                final_bonds = environment_data[-1].get('element_bonds', {}).get(element, {})
+                
+                if initial_bonds:
+                    f.write(f"  Initial: CN={initial_bonds['count']}, "
+                           f"Avg={initial_bonds['average']:.3f} Å "
+                           f"({initial_bonds['min']:.3f}-{initial_bonds['max']:.3f} Å)\n")
+                
+                if final_bonds:
+                    f.write(f"  Final: CN={final_bonds['count']}, "
+                           f"Avg={final_bonds['average']:.3f} Å "
+                           f"({final_bonds['min']:.3f}-{final_bonds['max']:.3f} Å)\n")
+                
+                # Element-specific correlations
+                if correlations and 'element_specific' in correlations:
+                    elem_corr = correlations['element_specific'].get(element, {})
+                    if 'coordination' in elem_corr:
+                        f.write(f"  CN-Energy Correlation: {elem_corr['coordination']:.3f}\n")
+                    if 'avg_bond' in elem_corr:
+                        f.write(f"  Bond-Energy Correlation: {elem_corr['avg_bond']:.3f}\n")
+
             # Transitions
             transitions = correlations['transitions']
             if transitions['coordination_changes']:
@@ -655,7 +734,81 @@ class OxygenEnvironmentAnalyzer:
         
         logger.info(f"Analysis report saved to {output_path}")
         return output_path
-    
+
+    def save_detailed_csv(self, environment_data: List[Dict], 
+                         energies: List[float], 
+                         output_path: str = None) -> str:
+        """
+        Save detailed analysis to CSV file including element-specific bond data.
+        
+        Args:
+            environment_data: Environment analysis data
+            energies: Energy values
+            output_path: Output CSV file path
+            
+        Returns:
+            Path to saved CSV file
+        """
+        if output_path is None:
+            output_path = "oxygen_migration_detailed_analysis.csv"
+        
+        # Prepare data for CSV
+        csv_data = []
+        
+        # Get all unique elements across all images
+        all_elements = set()
+        for env in environment_data:
+            if 'element_bonds' in env:
+                all_elements.update(env['element_bonds'].keys())
+        all_elements = sorted(list(all_elements))
+        
+        # Process each image
+        for i, env in enumerate(environment_data):
+            row = {
+                'image': env['image'],
+                'energy_eV': energies[i] if i < len(energies) else None,
+                'relative_energy_eV': energies[i] - energies[0] if i < len(energies) and energies else None,
+                'coordination_number': env['geometry']['coordination_number'],
+                'geometry_type': env['geometry']['geometry_type'],
+                'overall_avg_bond_length': env['coordination']['average_bond_length'],
+                'overall_min_bond_length': env['coordination']['min_bond_length'],
+                'overall_max_bond_length': env['coordination']['max_bond_length'],
+                'bond_length_variance': env['geometry'].get('bond_length_variance', 0),
+                'bond_distortion_index': env['geometry'].get('bond_distortion_index', 0),
+                'angular_distortion': env['geometry'].get('angular_distortion', 0)
+            }
+            
+            # Add element-specific data
+            element_bonds = env.get('element_bonds', {})
+            for element in all_elements:
+                if element in element_bonds:
+                    stats = element_bonds[element]
+                    row[f'{element}_coordination'] = stats['count']
+                    row[f'{element}_min_bond'] = stats['min']
+                    row[f'{element}_max_bond'] = stats['max']
+                    row[f'{element}_avg_bond'] = stats['average']
+                    row[f'{element}_std_bond'] = stats['std']
+                else:
+                    row[f'{element}_coordination'] = 0
+                    row[f'{element}_min_bond'] = None
+                    row[f'{element}_max_bond'] = None
+                    row[f'{element}_avg_bond'] = None
+                    row[f'{element}_std_bond'] = None
+            
+            # Add neighbor type counts
+            neighbor_types = env['coordination']['neighbor_types']
+            for element in all_elements:
+                row[f'{element}_count'] = neighbor_types.get(element, 0)
+            
+            csv_data.append(row)
+        
+        # Convert to DataFrame and save
+        df = pd.DataFrame(csv_data)
+        df.to_csv(output_path, index=False, float_format='%.6f')
+        
+        logger.info(f"Detailed CSV analysis saved to {output_path}")
+        return output_path
+
     def _write_point_analysis(self, f, point_data: Dict):
         """Helper to write analysis for a key point."""
         f.write(f"\n{point_data['label']} (Image {point_data['image']}):\n")
@@ -772,7 +925,109 @@ class OxygenPathwayVisualizer:
         plt.close()
         
         return output_path
-    
+
+    def plot_element_specific_bonds(self, environment_data: List[Dict],
+                                  energies: List[float] = None,
+                                  output_path: str = None) -> str:
+        """
+        Plot element-specific bond length evolution.
+        
+        Args:
+            environment_data: Environment analysis data
+            energies: Optional energy profile
+            output_path: Output file path
+            
+        Returns:
+            Path to saved plot
+        """
+        # Get all unique elements
+        all_elements = set()
+        for env in environment_data:
+            if 'element_bonds' in env:
+                all_elements.update(env['element_bonds'].keys())
+        all_elements = sorted(list(all_elements))
+        
+        n_elements = len(all_elements)
+        if n_elements == 0:
+            logger.warning("No element-specific bond data found")
+            return None
+        
+        fig, axes = plt.subplots(n_elements, 1, figsize=(12, 4*n_elements), 
+                               sharex=True, squeeze=False)
+        
+        images = [env['image'] for env in environment_data]
+        
+        for idx, element in enumerate(all_elements):
+            ax = axes[idx, 0]
+            
+            # Extract data for this element
+            avg_bonds = []
+            min_bonds = []
+            max_bonds = []
+            coordinations = []
+            
+            for env in environment_data:
+                if 'element_bonds' in env and element in env['element_bonds']:
+                    stats = env['element_bonds'][element]
+                    avg_bonds.append(stats['average'])
+                    min_bonds.append(stats['min'])
+                    max_bonds.append(stats['max'])
+                    coordinations.append(stats['count'])
+                else:
+                    avg_bonds.append(None)
+                    min_bonds.append(None)
+                    max_bonds.append(None)
+                    coordinations.append(0)
+            
+            # Plot average with min/max range
+            valid_indices = [i for i, v in enumerate(avg_bonds) if v is not None]
+            if valid_indices:
+                valid_images = [images[i] for i in valid_indices]
+                valid_avg = [avg_bonds[i] for i in valid_indices]
+                valid_min = [min_bonds[i] for i in valid_indices]
+                valid_max = [max_bonds[i] for i in valid_indices]
+                
+                # Plot average line
+                color = self.element_colors.get(element, 'gray')
+                ax.plot(valid_images, valid_avg, 'o-', color=color, 
+                       linewidth=2, markersize=8, label=f'{element}-O average')
+                
+                # Add shaded region for min/max
+                ax.fill_between(valid_images, valid_min, valid_max, 
+                              alpha=0.3, color=color)
+                
+                # Add coordination numbers as text
+                for img_idx, coord in zip(valid_images, [coordinations[i] for i in valid_indices]):
+                    if coord > 0:
+                        ax.text(img_idx, valid_max[valid_images.index(img_idx)] + 0.02, 
+                               str(coord), ha='center', va='bottom', fontsize=8)
+            
+            ax.set_ylabel(f'{element}-O Bond Length (Å)', fontsize=12)
+            ax.set_title(f'{element}-O Coordination and Bond Lengths', fontsize=12)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right')
+            
+            # Add energy on secondary axis if provided
+            if idx == 0 and energies:
+                ax2 = ax.twinx()
+                rel_energies = [e - energies[0] for e in energies]
+                ax2.plot(images, rel_energies, '--', color='red', alpha=0.5, linewidth=1)
+                ax2.set_ylabel('Relative Energy (eV)', color='red', fontsize=10)
+                ax2.tick_params(axis='y', labelcolor='red')
+        
+        axes[-1, 0].set_xlabel('Image Number', fontsize=12)
+        
+        plt.suptitle('Element-Specific O-X Bond Evolution', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        if output_path is None:
+            output_path = "element_specific_bonds.png"
+        
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+
     def plot_environment_snapshot(self, structure: Structure, atom_idx: int,
                                 coord_info: Dict, image_number: int,
                                 projection: str = 'xy',
@@ -1391,7 +1646,11 @@ class OxygenMigrationWorkflow:
             # Create visualizations (adapt based on whether we have energies)
             logger.info("Creating visualizations...")
             viz_results = {}
-            
+
+            viz_results['element_specific_bonds'] = self.visualizer.plot_element_specific_bonds(
+            environment_data, energies if has_energies else None,
+            os.path.join(output_dir, "element_specific_bonds.png"))
+
             # These visualizations work without energies
             viz_results['coordination_evolution'] = self.visualizer.plot_coordination_evolution(
                 environment_data, energies if has_energies else None, 
@@ -1425,7 +1684,10 @@ class OxygenMigrationWorkflow:
                 landscape_features if has_energies else {},
                 os.path.join(output_dir, "analysis_report.txt"))
             results['reports']['main'] = report_path
-            
+            csv_path = self.analyzer.save_detailed_csv(
+                environment_data, energies if has_energies else [],
+                os.path.join(output_dir, "detailed_analysis.csv"))
+            results['reports']['detailed_csv'] = csv_path
             # Generate summary
             results['summary'] = self._generate_summary(
                 environment_data, energies if has_energies else None, 

@@ -244,7 +244,7 @@ def check_neb_convergence(neb_dir, n_images):
     print(f"  Images with valid output: {completed_images}/{total_images}")
     
     # Consider converged if most images have valid output and main job shows accuracy
-    convergence_threshold = total_images * 0.9  # Higher threshold for more confidence
+    convergence_threshold = total_images - 2  # Higher threshold for more confidence
     has_sufficient_images = completed_images >= convergence_threshold
     
     # Final decision based on multiple criteria
@@ -970,7 +970,7 @@ if neb_option == 'multi':
             print(f"  ✓ Stage {i+1} completed")
         else:
             print(f"  ✗ Stage {i+1} failed")
-            break
+            #break
     
     # Analyze final results
     print("\n--- Analyzing Multi-stage Results ---")
