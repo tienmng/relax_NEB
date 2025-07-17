@@ -193,77 +193,51 @@ class OxygenEnvironmentAnalyzer:
     def analyze_coordination(self, structure: Structure, atom_idx: int, 
                            method: str = 'crystal') -> Dict:
         """
-        Analyze coordination environment of an atom with better error handling.
+        Analyze coordination environment of an atom using distance-based method with PBC.
         """
-        # Validate inputs
-        if atom_idx < 0 or atom_idx >= len(structure):
-            logger.error(f"Invalid atom index {atom_idx} for structure with {len(structure)} atoms")
-            return self._empty_coordination_info()
-        
-        if method == 'crystal':
-            nn_finder = self.cnn
-        elif method == 'voronoi':
-            nn_finder = self.vnn
-        else:
-            nn_finder = self.mdnn
-            
-        try:
-            # Get neighbors
-            neighbors = nn_finder.get_nn_info(structure, atom_idx)
-            
-            # Analyze coordination
-            coord_info = {
-                'coordination_number': len(neighbors),
-                'neighbors': [],
-                'bond_lengths': [],
-                'neighbor_types': defaultdict(int),
-                'average_bond_length': 0.0,
-                'min_bond_length': float('inf'),
-                'max_bond_length': 0.0
-            }
-            
-            for neighbor in neighbors:
-                element = str(structure[neighbor['site_index']].specie)
-                distance = neighbor.get('weight', 0.0)  # Weight often stores distance
-                
-                # For some methods, calculate distance manually
-                if distance == 0.0:
-                    site1 = structure[atom_idx].coords
-                    site2 = structure[neighbor['site_index']].coords
-                    distance = np.linalg.norm(site1 - site2)
-                
-                coord_info['neighbors'].append({
-                    'index': neighbor['site_index'],
-                    'element': element,
-                    'distance': distance,
-                    'image': neighbor.get('image', [0, 0, 0])
-                })
-                
-                coord_info['bond_lengths'].append(distance)
-                coord_info['neighbor_types'][element] += 1
-                
-            # Calculate statistics
-            if coord_info['bond_lengths']:
-                coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
-                coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
-                coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
-                
-        except Exception as e:  
-            logger.warning(f"Error analyzing coordination with {method}: {e}")
-            # Try alternative methods before falling back
-            if method == 'crystal':
-                logger.info("Trying Voronoi method...")
-                return self.analyze_coordination(structure, atom_idx, 'voronoi')
-            elif method == 'voronoi':
-                logger.info("Trying distance method...")
-                return self.analyze_coordination(structure, atom_idx, 'distance')
-            else:
-                # Final fallback
-                return self._simple_coordination_analysis(structure, atom_idx)
+        # Force distance-based method regardless of input
+        return self._distance_based_coordination_pbc(structure, atom_idx)
 
+    def _distance_based_coordination_pbc(self, structure: Structure, 
+                                       atom_idx: int) -> Dict:
+        """
+        Distance-based coordination analysis with proper PBC handling.
+        """
+        coord_info = {
+            'coordination_number': 0,
+            'neighbors': [],
+            'bond_lengths': [],
+            'neighbor_types': defaultdict(int),
+            'average_bond_length': 0.0,
+            'min_bond_length': float('inf'),
+            'max_bond_length': 0.0
+        }
+        
+        # Get all neighbors within cutoff using PBC
+        neighbors = structure.get_neighbors(structure[atom_idx], self.cutoff_radius)
+        
+        for neighbor_site, distance, index in neighbors:
+            element = str(neighbor_site.specie)
             
+            coord_info['neighbors'].append({
+                'index': index,
+                'element': element,
+                'distance': distance,
+                'image': [0, 0, 0]  # Not tracking image for simplicity
+            })
+            
+            coord_info['bond_lengths'].append(distance)
+            coord_info['neighbor_types'][element] += 1
+        
+        coord_info['coordination_number'] = len(coord_info['neighbors'])
+        
+        if coord_info['bond_lengths']:
+            coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
+            coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
+            coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
+        
         return coord_info
-    
+
     def _simple_coordination_analysis(self, structure: Structure, 
                                     atom_idx: int) -> Dict:
         """
