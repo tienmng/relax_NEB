@@ -238,12 +238,12 @@ class OxygenEnvironmentAnalyzer:
         
         coord_info['coordination_number'] = len(coord_info['neighbors'])
     
-    if coord_info['bond_lengths']:
-        coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
-        coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
-        coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
-    
-    return coord_info
+        if coord_info['bond_lengths']:
+            coord_info['average_bond_length'] = np.mean(coord_info['bond_lengths'])
+            coord_info['min_bond_length'] = min(coord_info['bond_lengths'])
+            coord_info['max_bond_length'] = max(coord_info['bond_lengths'])
+        
+        return coord_info
 
     def _simple_coordination_analysis(self, structure: Structure, 
                                     atom_idx: int) -> Dict:
