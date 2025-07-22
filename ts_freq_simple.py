@@ -364,7 +364,7 @@ fi
         return results
 
 
-def main():
+def main(args=None):
     """Main function to run frequency calculation."""
     parser = argparse.ArgumentParser(description='Simple frequency calculator for transition states')
     parser.add_argument('--input-dir', default='.', help='Directory containing structure file')
@@ -377,7 +377,7 @@ def main():
     parser.add_argument('--analyze', help='Analyze completed calculation in given directory')
     parser.add_argument('--source-info', help='Additional info about structure source')
     
-    args = parser.parse_args()
+    args = parser.parse_args(args)
     
     # Initialize calculator
     calc = SimpleFrequencyCalculator()
