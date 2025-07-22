@@ -450,4 +450,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    custom_args = [
+        '--input-dir', 'multistage_neb/neb_stage3/03',
+        '--output-dir', 'freq_calc_stage3',
+        '--moving-atom', '5',
+        '--freeze-radius', '2.5',
+        '--submit'
+    ]
+    main(args=custom_args)
+
